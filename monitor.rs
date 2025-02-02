@@ -1,6 +1,17 @@
 #![feature(async_fn_in_trait)]
 #![allow(unused_imports)]
 
+extern crate solana_client;
+extern crate solana_sdk;
+extern crate solana_transaction_status;
+extern crate tokio;
+extern crate log4rs;
+extern crate dirs;
+extern crate serde_json;
+extern crate chrono;
+extern crate env_logger;
+extern crate colored;
+
 use {
     anyhow::{Result, anyhow},
     log,
@@ -34,8 +45,7 @@ use {
         config::{Appender, Config, Root},
         encode::pattern::PatternEncoder,
     },
-    colored::Colorize,
-};
+    colored::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
@@ -189,6 +199,24 @@ struct TokenInfo {
     creator: Pubkey,
 }
 
+impl From<TokenResponse> for TokenInfo {
+    fn from(response: TokenResponse) -> Self {
+        Self {
+            mint: response.data.mint,
+            name: response.data.name,
+            symbol: response.data.symbol,
+            market_cap: response.data.market_cap,
+            liquidity: response.data.liquidity,
+            holder_count: response.data.holder_count,
+            holder_concentration: response.data.holder_concentration,
+            verified: response.data.verified,
+            price: response.data.price,
+            supply: response.data.supply,
+            creator: response.data.creator,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CreatorHistory {
     success_tokens: Vec<SuccessToken>,
@@ -245,65 +273,15 @@ impl ProxyPool {
             last_check: SystemTime::now(),
         }
     }
+}
 
-    async fn get_next_proxy(&mut self) -> Option<reqwest::Proxy> {
-        if self.proxies.is_empty() {
-            return None;
+impl Default for ProxyPool {
+    fn default() -> Self {
+        Self {
+            proxies: Vec::new(),
+            current_index: 0,
+            last_check: SystemTime::now(),
         }
-
-        if self.last_check.elapsed().unwrap().as_secs() > 600 {
-            self.check_proxies().await;
-            self.last_check = SystemTime::now();
-        }
-
-        let proxy = &self.proxies[self.current_index];
-        self.current_index = (self.current_index + 1) % self.proxies.len();
-
-        Some(reqwest::Proxy::http(&format!(
-            "http://{}:{}@{}:{}",
-            proxy.username,
-            proxy.password,
-            proxy.ip,
-            proxy.port
-        )).unwrap())
-    }
-
-    async fn check_proxies(&mut self) {
-        let client = reqwest::Client::new();
-        let mut valid_proxies = Vec::new();
-
-        for proxy in &self.proxies {
-            let proxy_url = format!(
-                "http://{}:{}@{}:{}",
-                proxy.username,
-                proxy.password,
-                proxy.ip,
-                proxy.port
-            );
-
-            let proxy = match reqwest::Proxy::http(&proxy_url) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            let test_client = match client.clone()
-                .proxy(proxy)
-                .build() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            match test_client.get("https://api.mainnet-beta.solana.com")
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await {
-                Ok(_) => valid_proxies.push(proxy.clone()),
-                Err(_) => log::warn!("代理不可用: {}", proxy_url),
-            }
-        }
-
-        self.proxies = valid_proxies;
-        self.current_index = 0;
     }
 }
 
@@ -1020,15 +998,15 @@ impl TokenMonitor {
             .map(|chain| chain.total_amount)
             .sum();
             
-        msg.push(format!("💸 资金追踪 (总流入: {:.1f} SOL)", total_transfer));
+        msg.push(format!("💸 资金追踪 (总流入: {:.1} SOL)", total_transfer));
         
         for (i, chain) in fund_flow.iter().enumerate() {
-            msg.push(format!("┣━ 资金链#{} ({:.1f} SOL)", i + 1, chain.total_amount));
+            msg.push(format!("┣━ 资金链#{} ({:.1} SOL)", i + 1, chain.total_amount));
             
             for transfer in &chain.transfers {
                 let time_str = self.format_timestamp(transfer.timestamp);
                 msg.push(format!(
-                    "┃   ⬆️ {:.1f} SOL ({}) | 来自: {}",
+                    "┃   ⬆️ {:.1} SOL ({}) | 来自: {}",
                     transfer.amount,
                     time_str,
                     transfer.source
@@ -1403,6 +1381,7 @@ impl TokenMonitor {
                 "5" => {
                     let export_path = Path::new("exported_addresses.txt");
                     let content = self.watch_addresses.iter()
+                        .map(|s| s.as_str())
                         .collect::<Vec<_>>()
                         .join("\n");
                         
