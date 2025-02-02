@@ -19,6 +19,11 @@ use {
     serde::{Deserialize, Serialize},
     solana_client::rpc_client::RpcClient,
     solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey},
+    solana_transaction_status::{
+        EncodedConfirmedBlock,
+        EncodedTransaction,
+        UiTransactionEncoding,
+    },
     std::{
         collections::{HashMap, HashSet},
         sync::Arc,
@@ -45,7 +50,8 @@ use {
         config::{Appender, Config, Root},
         encode::pattern::PatternEncoder,
     },
-    colored::*;
+    colored::*,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
@@ -201,19 +207,7 @@ struct TokenInfo {
 
 impl From<TokenResponse> for TokenInfo {
     fn from(response: TokenResponse) -> Self {
-        Self {
-            mint: response.data.mint,
-            name: response.data.name,
-            symbol: response.data.symbol,
-            market_cap: response.data.market_cap,
-            liquidity: response.data.liquidity,
-            holder_count: response.data.holder_count,
-            holder_concentration: response.data.holder_concentration,
-            verified: response.data.verified,
-            price: response.data.price,
-            supply: response.data.supply,
-            creator: response.data.creator,
-        }
+        response.data
     }
 }
 
@@ -272,6 +266,66 @@ impl ProxyPool {
             current_index: 0,
             last_check: SystemTime::now(),
         }
+    }
+
+    async fn get_next_proxy(&mut self) -> Option<reqwest::Proxy> {
+        if self.proxies.is_empty() {
+            return None;
+        }
+
+        if self.last_check.elapsed().unwrap().as_secs() > 600 {
+            self.check_proxies().await;
+            self.last_check = SystemTime::now();
+        }
+
+        let proxy = &self.proxies[self.current_index];
+        self.current_index = (self.current_index + 1) % self.proxies.len();
+
+        Some(reqwest::Proxy::http(&format!(
+            "http://{}:{}@{}:{}",
+            proxy.username,
+            proxy.password,
+            proxy.ip,
+            proxy.port
+        )).unwrap())
+    }
+
+    async fn check_proxies(&mut self) {
+        let client = reqwest::Client::new();
+        let mut valid_proxies = Vec::new();
+
+        for proxy in &self.proxies {
+            let proxy_url = format!(
+                "http://{}:{}@{}:{}",
+                proxy.username,
+                proxy.password,
+                proxy.ip,
+                proxy.port
+            );
+
+            let proxy = match reqwest::Proxy::http(&proxy_url) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let test_client = match client.clone()
+                .proxy(proxy)
+                .build() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            match test_client.get("https://api.mainnet-beta.solana.com")
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await {
+                Ok(_) => valid_proxies.push(proxy.clone()),
+                Err(_) => log::warn!("代理不可用: {}", proxy_url),
+            }
+        }
+
+        self.proxies = valid_proxies;
+        self.current_index = 0;
     }
 }
 
@@ -1775,6 +1829,7 @@ struct TokenResponse {
 
 #[derive(Debug, Deserialize)]
 struct TokenData {
+    mint: Pubkey,
     name: String,
     symbol: String,
     market_cap: f64,
@@ -1784,6 +1839,7 @@ struct TokenData {
     verified: bool,
     price: f64,
     supply: u64,
+    creator: Pubkey,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1824,7 +1880,7 @@ struct TokenListItem {
     created_at: u64,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     env_logger::init();
     
