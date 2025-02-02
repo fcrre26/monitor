@@ -10,6 +10,9 @@ use {
         sync::Arc,
         time::{Duration, SystemTime, Instant},
         fs,
+        fs::File,
+        io::Read,
+        process,
     },
     tokio::{
         sync::{mpsc, Mutex},
@@ -27,6 +30,7 @@ use {
         config::{Appender, Config, Root},
         encode::pattern::PatternEncoder,
     },
+    colored::*
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1135,8 +1139,9 @@ impl TokenMonitor {
         println!("6. 管理代理");
         println!("7. 生成配置文件");
         println!("8. 管理日志");
-        println!("9. 退出");
-        println!("请选择功能 (1-9): ");
+        println!("9. 测试Server酱通知");
+        println!("10. 退出");
+        println!("请选择功能 (1-10): ");
 
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
@@ -1178,6 +1183,9 @@ impl TokenMonitor {
                 self.manage_logs().await?;
             }
             "9" => {
+                self.test_serverchan();
+            }
+            "10" => {
                 println!("退出程序");
                 self.save_monitor_state().await?;
                 std::process::exit(0);
@@ -1531,6 +1539,117 @@ impl TokenMonitor {
         }
 
         Ok(())
+    }
+
+    fn test_serverchan(&self) {
+        println!("\n{}", ">>> 测试Server酱通知...".yellow());
+        
+        // 模拟一个发现的代币数据
+        let mock_token = TokenInfo {
+            mint: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".parse().unwrap(),
+            name: "Solana Monkey Business".to_string(),
+            symbol: "SMB".to_string(),
+            market_cap: 15_000_000.0,
+            liquidity: 2500.0,
+            holder_count: 5823,
+            holder_concentration: 35.8,
+            verified: true,
+            price: 0.00145,
+            supply: 5000_000_000,
+        };
+
+        // 模拟创建者历史
+        let mock_creator_history = CreatorHistory {
+            success_tokens: vec![
+                SuccessToken {
+                    address: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".parse().unwrap(),
+                    symbol: "SAMO".to_string(),
+                    name: "Samoyedcoin".to_string(),
+                    market_cap: 25_000_000.0,
+                    created_at: 1640995200,
+                },
+                SuccessToken {
+                    address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().unwrap(),
+                    symbol: "USDC".to_string(),
+                    name: "USD Coin".to_string(),
+                    market_cap: 1_200_000_000.0,
+                    created_at: 1620000000,
+                },
+            ],
+            total_tokens: 5,
+        };
+
+        // 模拟资金流动
+        let mock_fund_flow = vec![
+            FundingChain {
+                transfers: vec![
+                    Transfer {
+                        source: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".parse().unwrap(),
+                        amount: 1250.5,
+                        timestamp: 1711008000, // 2024-03-21 12:00:00
+                        tx_id: "5KtPn1LGuxhFqnXGKxgVPJ6eXrec8LD6ENxgfvzewZFwRBpfnyaQYKCYXgYjkKxVGvnkxhQp".to_string(),
+                        success_tokens: Some(vec![
+                            SuccessToken {
+                                address: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".parse().unwrap(),
+                                symbol: "SAMO".to_string(),
+                                name: "Samoyedcoin".to_string(),
+                                market_cap: 25_000_000.0,
+                                created_at: 1640995200,
+                            }
+                        ]),
+                    }
+                ],
+                total_amount: 1250.5,
+                risk_score: 25,
+            }
+        ];
+
+        let mock_analysis = TokenAnalysis {
+            token_info: mock_token,
+            creator_history: mock_creator_history,
+            fund_flow: mock_fund_flow,
+            risk_score: 35,
+            is_new_wallet: false,
+            wallet_age: 245.5,
+        };
+
+        // 生成通知消息
+        let message = self.format_message(&mock_analysis);
+        
+        // 添加模拟测试标记
+        let test_message = format!(
+            "[⚠️ 这是一条模拟测试消息]\n测试时间: {}\n--------------------------------\n\n{}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            message
+        );
+        
+        for key in &self.config.serverchan.keys {
+            println!("\n{} Server酱密钥: {}...{}", ">>>".yellow(), &key[..8], &key[key.len()-8..]);
+            
+            println!("{}", "模拟请求内容:".blue());
+            println!("URL: https://sctapi.ftqq.com/{}.send", key);
+            println!("参数:");
+            println!("  - title: [模拟测试] Solana新代币提醒");
+            println!("  - desp: {}", test_message);
+            
+            println!("\n{}", "模拟响应:".blue());
+            println!("{{");
+            println!("    \"code\": 0,");
+            println!("    \"message\": \"\",");
+            println!("    \"data\": {{");
+            println!("        \"pushid\": \"mock-xxxxx\",");
+            println!("        \"readkey\": \"mock-xxxxx\",");
+            println!("        \"error\": \"SUCCESS\",");
+            println!("        \"errno\": 0");
+            println!("    }}");
+            println!("}}");
+            
+            println!("\n{}", "✓ 模拟发送成功".green());
+        }
+        
+        if self.config.serverchan.keys.is_empty() {
+            println!("{}", "没有配置Server酱密钥".yellow());
+        }
     }
 }
 
