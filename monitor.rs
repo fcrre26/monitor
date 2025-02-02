@@ -1,5 +1,8 @@
+#![feature(async_fn_in_trait)]
+#![allow(unused_imports)]
+
 use {
-    anyhow::Result,
+    anyhow::{Result, anyhow},
     log,
     reqwest,
     serde::{Deserialize, Serialize},
@@ -31,7 +34,7 @@ use {
         config::{Appender, Config, Root},
         encode::pattern::PatternEncoder,
     },
-    colored::*
+    colored::Colorize,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +44,42 @@ struct Config {
     wcf: WeChatFerryConfig,
     proxy: ProxyConfig,
     rpc_nodes: HashMap<String, RpcNodeConfig>,
+}
+
+impl Config {
+    fn builder() -> ConfigBuilder {
+        ConfigBuilder::default()
+    }
+}
+
+#[derive(Default)]
+struct ConfigBuilder {
+    appenders: Vec<Appender>,
+    root: Option<Root>,
+}
+
+impl ConfigBuilder {
+    fn appender(mut self, appender: Appender) -> Self {
+        self.appenders.push(appender);
+        self
+    }
+
+    fn build(self, root: Root) -> Result<Config> {
+        // 实现构建逻辑
+        Ok(Config {
+            api_keys: Vec::new(),
+            serverchan: ServerChanConfig { keys: Vec::new() },
+            wcf: WeChatFerryConfig { groups: Vec::new() },
+            proxy: ProxyConfig {
+                enabled: false,
+                ip: String::new(),
+                port: 0,
+                username: String::new(),
+                password: String::new(),
+            },
+            rpc_nodes: HashMap::new(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,13 +114,25 @@ struct RpcNodeConfig {
     last_used: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Metrics {
     processed_blocks: u64,
     processed_txs: u64,
     missed_blocks: HashSet<u64>,
     processing_delays: Vec<Duration>,
     last_process_time: Instant,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            processed_blocks: 0,
+            processed_txs: 0,
+            missed_blocks: HashSet::new(),
+            processing_delays: Vec::new(),
+            last_process_time: Instant::now(),
+        }
+    }
 }
 
 struct TokenMonitor {
@@ -99,11 +150,21 @@ struct TokenMonitor {
     proxy_pool: Arc<Mutex<ProxyPool>>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MonitorState {
     last_slot: u64,
     processed_mints: HashSet<String>,
     start_time: SystemTime,
+}
+
+impl Default for MonitorState {
+    fn default() -> Self {
+        Self {
+            last_slot: 0,
+            processed_mints: HashSet::new(),
+            start_time: SystemTime::now(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -125,6 +186,7 @@ struct TokenInfo {
     verified: bool,
     price: f64,
     supply: u64,
+    creator: Pubkey,
 }
 
 #[derive(Debug, Clone)]
@@ -268,7 +330,7 @@ impl TokenMonitor {
 
     fn init_logger() -> Result<()> {
         let log_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?
             .join(".solana_pump/logs");
         
         fs::create_dir_all(&log_dir)?;
@@ -460,7 +522,7 @@ impl TokenMonitor {
 
     fn load_config() -> Result<Config> {
         let config_path = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?
             .join(".solana_pump.cfg");
 
         let config_str = fs::read_to_string(config_path)?;
@@ -514,7 +576,7 @@ impl TokenMonitor {
                 Err(e) => log::warn!("RPC client error: {}", e),
             }
         }
-        Err(anyhow::anyhow!("All RPC clients failed"))
+        Err(anyhow!("All RPC clients failed"))
     }
 
     async fn process_block(
@@ -887,7 +949,7 @@ impl TokenMonitor {
             .await?;
             
         if !res.status().is_success() {
-            return Err(anyhow::anyhow!("ServerChan push failed: {}", res.text().await?));
+            return Err(anyhow!("ServerChan push failed: {}", res.text().await?));
         }
         
         Ok(())
@@ -906,7 +968,7 @@ impl TokenMonitor {
             format!("┣━ 代币地址: {}", analysis.token_info.mint),
             format!("┣━ 创建者: {}", analysis.token_info.creator),
             format!(
-                "┗━ 钱包状态: {} | 钱包年龄: {:.1f} 天",
+                "┗━ 钱包状态: {} | 钱包年龄: {:.1} 天",
                 if analysis.is_new_wallet { "🆕 新钱包" } else { "📅 老钱包" },
                 analysis.wallet_age
             ),
@@ -923,7 +985,6 @@ impl TokenMonitor {
         }
 
         self.add_risk_assessment(&mut msg, analysis);
-
         self.add_quick_links(&mut msg, &analysis.token_info);
 
         msg.join("\n")
@@ -939,17 +1000,17 @@ impl TokenMonitor {
                 if token_info.verified { "✅ 已认证" } else { "❌ 未认证" }
             ),
             format!(
-                "┃ 初始市值: ${:<12} | 代币供应量: {:<8} | 单价: ${:.8f} ┃",
+                "┃ 初始市值: ${:<12} | 代币供应量: {:<8} | 单价: ${} ┃",
                 self.format_number(token_info.market_cap),
-                self.format_number(token_info.supply),
+                self.format_number(token_info.supply as f64),
                 token_info.price
             ),
             format!(
-                "┃ 流动性: {:.2f} SOL{} | 持有人数: {:<8} | 前10持有比: {:.1f}% ┃",
-                token_info.liquidity,
+                "┃ 流动性: {} SOL{} | 持有人数: {:<8} | 前10持有比: {}% ┃",
+                self.format_number(token_info.liquidity),
                 " ".repeat(8),
                 token_info.holder_count,
-                token_info.holder_concentration
+                self.format_number(token_info.holder_concentration)
             ),
         ]);
     }
@@ -1242,7 +1303,7 @@ impl TokenMonitor {
 
     fn load_monitor_state() -> Result<MonitorState> {
         let state_file = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?
             .join(".solana_pump/monitor_state.json");
 
         if !state_file.exists() {
@@ -1255,7 +1316,7 @@ impl TokenMonitor {
 
     async fn save_monitor_state(&self) -> Result<()> {
         let state_file = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?
             .join(".solana_pump/monitor_state.json");
 
         let state = self.monitor_state.lock().await;
@@ -1460,7 +1521,7 @@ impl TokenMonitor {
 
     fn load_proxy_list() -> Result<Vec<ProxyConfig>> {
         let proxy_file = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?
             .join(".solana_pump/proxies.json");
 
         if !proxy_file.exists() {
@@ -1473,7 +1534,7 @@ impl TokenMonitor {
 
     fn generate_config_files() -> Result<()> {
         let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?;
         
         let config_dir = home.join(".solana_pump");
         fs::create_dir_all(&config_dir)?;
@@ -1630,6 +1691,7 @@ impl TokenMonitor {
             verified: true,
             price: 0.00145,
             supply: 5000_000_000,
+            creator: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".parse().unwrap(),
         };
 
         // 模拟创建者历史
