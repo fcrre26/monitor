@@ -1,4 +1,3 @@
-#![feature(async_fn_in_trait)]
 #![allow(unused_imports)]
 
 extern crate solana_client;
@@ -13,7 +12,7 @@ extern crate env_logger;
 extern crate colored;
 
 use {
-    anyhow::{Result, anyhow},
+    anyhow::Result,
     log,
     reqwest,
     serde::{Deserialize, Serialize},
@@ -28,7 +27,6 @@ use {
         collections::{HashMap, HashSet},
         sync::Arc,
         time::{Duration, SystemTime, Instant},
-        fs,
         fs::File,
         io::Read,
         process,
@@ -242,7 +240,7 @@ struct Transfer {
     success_tokens: Option<Vec<SuccessToken>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct TokenAnalysis {
     token_info: TokenInfo,
     creator_history: CreatorHistory,
@@ -252,7 +250,7 @@ struct TokenAnalysis {
     wallet_age: f64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ProxyPool {
     proxies: Vec<ProxyConfig>,
     current_index: usize,
@@ -260,32 +258,59 @@ struct ProxyPool {
 }
 
 impl ProxyPool {
-    fn new(proxies: Vec<ProxyConfig>) -> Self {
-        Self {
-            proxies,
-            current_index: 0,
-            last_check: SystemTime::now(),
-        }
-    }
-
     async fn get_next_proxy(&mut self) -> Option<reqwest::Proxy> {
-        if !self.config.proxy.enabled {
+        if self.proxies.is_empty() {
             return None;
         }
 
-        let proxy_url = format!(
-            "http://{}:{}@{}:{}",
-            self.config.proxy.username,
-            self.config.proxy.password,
-            self.config.proxy.ip,
-            self.config.proxy.port
-        );
+        let proxy = &self.proxies[self.current_index];
+        self.current_index = (self.current_index + 1) % self.proxies.len();
 
-        Some(reqwest::Proxy::http(&proxy_url).unwrap())
+        Some(reqwest::Proxy::http(&format!(
+            "http://{}:{}@{}:{}",
+            proxy.username,
+            proxy.password,
+            proxy.ip,
+            proxy.port
+        )).unwrap())
     }
 
     async fn check_proxies(&mut self) {
-        // ... 原有代码 ...
+        let client = reqwest::Client::new();
+        let mut valid_proxies = Vec::new();
+
+        for proxy in &self.proxies {
+            let proxy_url = format!(
+                "http://{}:{}@{}:{}",
+                proxy.username,
+                proxy.password,
+                proxy.ip,
+                proxy.port
+            );
+
+            let proxy = match reqwest::Proxy::http(&proxy_url) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let test_client = match client.clone()
+                .proxy(proxy)
+                .build() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            match test_client.get("https://api.mainnet-beta.solana.com")
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await {
+                Ok(_) => valid_proxies.push(proxy.clone()),
+                Err(_) => log::warn!("代理不可用: {}", proxy_url),
+            }
+        }
+
+        self.proxies = valid_proxies;
+        self.current_index = 0;
     }
 }
 
@@ -874,7 +899,9 @@ impl TokenMonitor {
             .post(&format!("https://sctapi.ftqq.com/{}.send", key))
             .form(&[
                 ("title", "Solana新代币提醒"),
-                ("desp", message),
+                ("desp", &format!("{}\n\n**合约地址(点击复制)**\n```\n{}\n```", 
+                    message, 
+                    analysis.token_info.mint)),
             ])
             .send()
             .await?;
@@ -895,11 +922,11 @@ impl TokenMonitor {
         let mut msg = vec![
             "┏━━━━━━━━━━━━━━━━━━━━━ 🔔 发现新代币 (UTC+8) ━━━━━━━━━━━━━━━━━━━━━┓".to_string(),
             "".to_string(),
-            "📋 基本信息".to_string(),
-            format!("┣━ 代币地址: {}", analysis.token_info.mint),
+            "📋 合约信息".to_string(),
+            format!("┣━ CA: {}", analysis.token_info.mint),
             format!("┣━ 创建者: {}", analysis.token_info.creator),
             format!(
-                "┗━ 钱包状态: {} | 钱包年龄: {:.1} 天",
+                "┗━ 钱包状态: {} | 钱包年龄: {:.1f} 天",
                 if analysis.is_new_wallet { "🆕 新钱包" } else { "📅 老钱包" },
                 analysis.wallet_age
             ),
@@ -954,14 +981,16 @@ impl TokenMonitor {
         msg.push(format!("💸 资金追踪 (总流入: {:.2} SOL)", total_transfer));
         
         for (i, chain) in fund_flow.iter().enumerate() {
-            msg.push(format!("┣━ 资金链#{} ({:.2} SOL)", i + 1, chain.total_amount));
+            msg.push(format!("┣━ 资金链#{} ({:.2} SOL) - 上游资金追踪", i + 1, chain.total_amount));
             
-            for transfer in &chain.transfers {
+            for (j, transfer) in chain.transfers.iter().enumerate() {
+                let wallet_level = (b'E' - j as u8) as char;
                 let time_str = self.format_timestamp(transfer.timestamp);
                 msg.push(format!(
-                    "┃   ⬆️ {:.2} SOL ({}) | 来自: {}",
+                    "┃   ⬆️ {:.2} SOL ({}) | 来自钱包{}: {}",
                     transfer.amount,
                     time_str,
+                    wallet_level,
                     transfer.source
                 ));
                 
@@ -969,9 +998,9 @@ impl TokenMonitor {
                     let token_info: Vec<String> = tokens.iter()
                         .map(|t| format!("{}(${:.2}M)", t.symbol, t.market_cap / 1_000_000.0))
                         .collect();
-                    msg.push(format!("┃   └─ 创建代币历史: {}", token_info.join(" ")));
+                    msg.push(format!("┃   └─ 创建者历史: {}", token_info.join(" ")));
                 } else {
-                    msg.push("┃   └─ 中转钱包".to_string());
+                    msg.push("┃   └─ 仅用于转账".to_string());
                 }
             }
         }
@@ -980,6 +1009,16 @@ impl TokenMonitor {
     fn add_creator_history(&self, msg: &mut Vec<String>, history: &CreatorHistory) {
         let active_tokens = history.success_tokens.len();
         let success_rate = active_tokens as f64 / history.total_tokens as f64;
+        
+        let best_token = history.success_tokens.iter()
+            .max_by_key(|t| (t.market_cap * 1000.0) as u64)
+            .unwrap();
+        let avg_market_cap = history.success_tokens.iter()
+            .map(|t| t.market_cap)
+            .sum::<f64>() / active_tokens as f64;
+        let latest_token = history.success_tokens.iter()
+            .max_by_key(|t| t.created_at)
+            .unwrap();
         
         msg.extend_from_slice(&[
             "┏━━━━━━━━━━━━━━━━━━━━━ 📜 创建者历史 ━━━━━━━━━━━━━━━━━━━━━┓".to_string(),
@@ -990,6 +1029,15 @@ impl TokenMonitor {
                 success_rate * 100.0,
                 " ".repeat(20)
             ),
+            format!(
+                "┃ 最佳业绩: {}(${:.1}M) | 平均市值: ${:.1}M | 最近: {}(${:.1}M) ┃",
+                best_token.symbol,
+                best_token.market_cap / 1_000_000.0,
+                avg_market_cap / 1_000_000.0,
+                latest_token.symbol,
+                latest_token.market_cap / 1_000_000.0
+            ),
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛".to_string(),
         ]);
     }
 
@@ -1779,7 +1827,7 @@ struct TokenListItem {
     created_at: u64,
 }
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
     let mut monitor = TokenMonitor::new().await?;
