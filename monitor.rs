@@ -13,6 +13,7 @@ use {
         fs::File,
         io::Read,
         process,
+        path::Path,
     },
     tokio::{
         sync::{mpsc, Mutex},
@@ -725,7 +726,7 @@ impl TokenMonitor {
                     source,
                     amount: transfer.amount,
                     timestamp: transfer.timestamp,
-                    tx_id: transfer.tx_id.clone(),
+                    tx_id: transfer.signature,
                     success_tokens: if success_tokens.is_empty() {
                         None
                     } else {
@@ -1229,9 +1230,7 @@ impl TokenMonitor {
     }
 
     fn load_watch_addresses() -> Result<HashSet<String>> {
-        let watch_file = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
-            .join(".solana_pump/watch_addresses.json");
+        let watch_file = Path::new("watch_addresses.json");
 
         if !watch_file.exists() {
             return Ok(HashSet::new());
@@ -1267,54 +1266,129 @@ impl TokenMonitor {
     }
 
     async fn manage_watch_addresses(&mut self) -> Result<()> {
-        println!("\n=== 监控地址管理 ===");
-        println!("1. 查看当前地址");
-        println!("2. 添加地址");
-        println!("3. 删除地址");
-        println!("4. 返回主菜单");
-        println!("请选择功能 (1-4): ");
+        loop {
+            println!("\n=== 监控地址管理 ===");
+            println!("1. 查看当前地址");
+            println!("2. 添加地址");
+            println!("3. 删除地址");
+            println!("4. 导入地址列表");
+            println!("5. 导出地址列表");
+            println!("6. 查看地址详情");
+            println!("7. 返回主菜单");
+            println!("请选择功能 (1-7): ");
 
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
 
-        match input.trim() {
-            "1" => {
-                println!("\n当前监控地址:");
-                for addr in &self.watch_addresses {
-                    println!("{}", addr);
+            match input.trim() {
+                "1" => {
+                    println!("\n当前监控地址 (共 {} 个):", self.watch_addresses.len());
+                    for addr in &self.watch_addresses {
+                        println!("{}", addr);
+                    }
                 }
+                "2" => {
+                    println!("请输入要添加的地址: ");
+                    let mut address = String::new();
+                    std::io::stdin().read_line(&mut address)?;
+                    let address = address.trim();
+                    
+                    match Pubkey::from_str(address) {
+                        Ok(_) => {
+                            self.watch_addresses.insert(address.to_string());
+                            self.save_watch_addresses()?;
+                            println!("✅ 地址添加成功");
+                        }
+                        Err(_) => println!("❌ 无效的Solana地址格式"),
+                    }
+                }
+                "3" => {
+                    println!("请输入要删除的地址: ");
+                    let mut address = String::new();
+                    std::io::stdin().read_line(&mut address)?;
+                    let address = address.trim();
+                    
+                    if self.watch_addresses.remove(address) {
+                        self.save_watch_addresses()?;
+                        println!("✅ 地址删除成功");
+                    } else {
+                        println!("❌ 地址不存在");
+                    }
+                }
+                "4" => {
+                    println!("请输入地址列表文件路径: ");
+                    let mut path = String::new();
+                    std::io::stdin().read_line(&mut path)?;
+                    let path = path.trim();
+                    
+                    match fs::read_to_string(path) {
+                        Ok(content) => {
+                            let mut count = 0;
+                            for line in content.lines() {
+                                let address = line.trim();
+                                if !address.is_empty() {
+                                    if let Ok(_) = Pubkey::from_str(address) {
+                                        self.watch_addresses.insert(address.to_string());
+                                        count += 1;
+                                    }
+                                }
+                            }
+                            self.save_watch_addresses()?;
+                            println!("✅ 成功导入 {} 个地址", count);
+                        }
+                        Err(e) => println!("❌ 读取文件失败: {}", e),
+                    }
+                }
+                "5" => {
+                    let export_path = Path::new("exported_addresses.txt");
+                    let content = self.watch_addresses.iter()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                        
+                    fs::write(&export_path, content)?;
+                    println!("✅ 地址已导出到: {}", export_path.display());
+                }
+                "6" => {
+                    println!("请输入要查看的地址: ");
+                    let mut address = String::new();
+                    std::io::stdin().read_line(&mut address)?;
+                    let address = address.trim();
+                    
+                    if let Ok(pubkey) = Pubkey::from_str(address) {
+                        match self.analyze_creator_history(&pubkey).await {
+                            Ok(history) => {
+                                println!("\n地址详情:");
+                                println!("历史发行代币: {} 个", history.total_tokens);
+                                println!("成功项目: {} 个", history.success_tokens.len());
+                                
+                                if !history.success_tokens.is_empty() {
+                                    println!("\n成功项目列表:");
+                                    for token in &history.success_tokens {
+                                        println!("- {} ({}) - 市值: ${:.2}M",
+                                            token.name,
+                                            token.symbol,
+                                            token.market_cap / 1_000_000.0
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => println!("❌ 获取地址信息失败: {}", e),
+                        }
+                    } else {
+                        println!("❌ 无效的Solana地址格式");
+                    }
+                }
+                "7" => break,
+                _ => println!("无效选项"),
             }
-            "2" => {
-                println!("请输入要添加的地址: ");
-                let mut address = String::new();
-                std::io::stdin().read_line(&mut address)?;
-                self.watch_addresses.insert(address.trim().to_string());
-                self.save_watch_addresses()?;
-                println!("地址添加成功");
-            }
-            "3" => {
-                println!("请输入要删除的地址: ");
-                let mut address = String::new();
-                std::io::stdin().read_line(&mut address)?;
-                self.watch_addresses.remove(address.trim());
-                self.save_watch_addresses()?;
-                println!("地址删除成功");
-            }
-            "4" => return Ok(()),
-            _ => println!("无效选项"),
         }
-
         Ok(())
     }
 
     fn save_watch_addresses(&self) -> Result<()> {
-        let watch_file = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
-            .join(".solana_pump/watch_addresses.json");
-
+        let watch_file = Path::new("watch_addresses.json");
         let content = serde_json::to_string_pretty(&self.watch_addresses)?;
         fs::write(watch_file, content)?;
-        
         Ok(())
     }
 
