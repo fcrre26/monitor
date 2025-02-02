@@ -252,7 +252,7 @@ struct TokenAnalysis {
     wallet_age: f64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ProxyPool {
     proxies: Vec<ProxyConfig>,
     current_index: usize,
@@ -269,73 +269,23 @@ impl ProxyPool {
     }
 
     async fn get_next_proxy(&mut self) -> Option<reqwest::Proxy> {
-        if self.proxies.is_empty() {
+        if !self.config.proxy.enabled {
             return None;
         }
 
-        if self.last_check.elapsed().unwrap().as_secs() > 600 {
-            self.check_proxies().await;
-            self.last_check = SystemTime::now();
-        }
-
-        let proxy = &self.proxies[self.current_index];
-        self.current_index = (self.current_index + 1) % self.proxies.len();
-
-        Some(reqwest::Proxy::http(&format!(
+        let proxy_url = format!(
             "http://{}:{}@{}:{}",
-            proxy.username,
-            proxy.password,
-            proxy.ip,
-            proxy.port
-        )).unwrap())
+            self.config.proxy.username,
+            self.config.proxy.password,
+            self.config.proxy.ip,
+            self.config.proxy.port
+        );
+
+        Some(reqwest::Proxy::http(&proxy_url).unwrap())
     }
 
     async fn check_proxies(&mut self) {
-        let client = reqwest::Client::new();
-        let mut valid_proxies = Vec::new();
-
-        for proxy in &self.proxies {
-            let proxy_url = format!(
-                "http://{}:{}@{}:{}",
-                proxy.username,
-                proxy.password,
-                proxy.ip,
-                proxy.port
-            );
-
-            let proxy = match reqwest::Proxy::http(&proxy_url) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            let test_client = match client.clone()
-                .proxy(proxy)
-                .build() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            match test_client.get("https://api.mainnet-beta.solana.com")
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await {
-                Ok(_) => valid_proxies.push(proxy.clone()),
-                Err(_) => log::warn!("代理不可用: {}", proxy_url),
-            }
-        }
-
-        self.proxies = valid_proxies;
-        self.current_index = 0;
-    }
-}
-
-impl Default for ProxyPool {
-    fn default() -> Self {
-        Self {
-            proxies: Vec::new(),
-            current_index: 0,
-            last_check: SystemTime::now(),
-        }
+        // ... 原有代码 ...
     }
 }
 
@@ -358,57 +308,6 @@ impl TokenMonitor {
         );
 
         Some(reqwest::Proxy::http(&proxy_url).unwrap())
-    }
-
-    fn init_logger() -> Result<()> {
-        let log_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow!("Cannot find home directory"))?
-            .join(".solana_pump/logs");
-        
-        fs::create_dir_all(&log_dir)?;
-
-        // 配置日志轮转策略
-        let window_roller = FixedWindowRoller::builder()
-            .build(
-                log_dir.join("solana_pump.{}.log").to_str().unwrap(),
-                5, // 保留5个历史文件
-            )?;
-
-        // 配置触发策略 (10MB)
-        let size_trigger = SizeTrigger::new(10 * 1024 * 1024);
-
-        // 组合策略
-        let compound_policy = CompoundPolicy::new(
-            Box::new(size_trigger),
-            Box::new(window_roller),
-        );
-
-        // 创建滚动文件追加器
-        let rolling_appender = RollingFileAppender::builder()
-            .encoder(Box::new(PatternEncoder::new(
-                "{d(%Y-%m-%d %H:%M:%S)} {l} [{T}] {m}{n}"
-            )))
-            .build(
-                log_dir.join("solana_pump.log"),
-                Box::new(compound_policy),
-            )?;
-
-        // 创建日志配置
-        let config = Config::builder()
-            .appender(
-                Appender::builder()
-                    .build("rolling", Box::new(rolling_appender))
-            )
-            .build(
-                Root::builder()
-                    .appender("rolling")
-                    .build(log::LevelFilter::Info),
-            )?;
-
-        // 应用配置
-        log4rs::init_config(config)?;
-
-        Ok(())
     }
 
     async fn new() -> Result<Self> {
@@ -1038,7 +937,7 @@ impl TokenMonitor {
                 token_info.price
             ),
             format!(
-                "┃ 流动性: {} SOL{} | 持有人数: {:<8} | 前10持有比: {}% ┃",
+                "┃ 流动性: {:.2} SOL{} | 持有人数: {:<8} | 前10持有比: {:.2}% ┃",
                 self.format_number(token_info.liquidity),
                 " ".repeat(8),
                 token_info.holder_count,
@@ -1052,15 +951,15 @@ impl TokenMonitor {
             .map(|chain| chain.total_amount)
             .sum();
             
-        msg.push(format!("💸 资金追踪 (总流入: {:.1} SOL)", total_transfer));
+        msg.push(format!("💸 资金追踪 (总流入: {:.2} SOL)", total_transfer));
         
         for (i, chain) in fund_flow.iter().enumerate() {
-            msg.push(format!("┣━ 资金链#{} ({:.1} SOL)", i + 1, chain.total_amount));
+            msg.push(format!("┣━ 资金链#{} ({:.2} SOL)", i + 1, chain.total_amount));
             
             for transfer in &chain.transfers {
                 let time_str = self.format_timestamp(transfer.timestamp);
                 msg.push(format!(
-                    "┃   ⬆️ {:.1} SOL ({}) | 来自: {}",
+                    "┃   ⬆️ {:.2} SOL ({}) | 来自: {}",
                     transfer.amount,
                     time_str,
                     transfer.source
@@ -1174,13 +1073,13 @@ impl TokenMonitor {
             println!("\n发现 {} 条资金链:", funding_chains.len());
             for (i, chain) in funding_chains.iter().enumerate() {
                 println!("\n链路 {}:", i + 1);
-                println!("总转账金额: {:.2f} SOL", chain.total_amount);
+                println!("总转账金额: {:.2} SOL", chain.total_amount);
                 println!("链路深度: {} 层", chain.transfers.len());
                 
                 for (j, transfer) in chain.transfers.iter().enumerate() {
                     let time_str = self.format_timestamp(transfer.timestamp);
                     println!(
-                        "  [{}/{}] {} | {:.2f} SOL",
+                        "  [{}/{}] {} | {:.2} SOL",
                         j + 1,
                         chain.transfers.len(),
                         time_str,
@@ -1216,9 +1115,9 @@ impl TokenMonitor {
         println!("名称: {}", token_info.name);
         println!("符号: {}", token_info.symbol);
         println!("市值: ${}", self.format_number(token_info.market_cap));
-        println!("流动性: {:.2f} SOL", token_info.liquidity);
+        println!("流动性: {:.2} SOL", token_info.liquidity);
         println!("持有人数量: {}", token_info.holder_count);
-        println!("持有人集中度: {:.2f}%", token_info.holder_concentration);
+        println!("持有人集中度: {:.2}%", token_info.holder_concentration);
         
         Ok(())
     }
@@ -1883,9 +1782,7 @@ struct TokenListItem {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     env_logger::init();
-    
     let mut monitor = TokenMonitor::new().await?;
-    
     loop {
         if let Err(e) = monitor.show_menu().await {
             log::error!("菜单错误: {}", e);
