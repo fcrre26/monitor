@@ -17,6 +17,7 @@ cd ~
 echo "下载监控脚本..."
 wget https://raw.githubusercontent.com/fcrre26/monitor/refs/heads/main/monitor.rs -O monitor.rs
 wget https://raw.githubusercontent.com/fcrre26/monitor/refs/heads/main/monitor.sh -O monitor.sh
+wget https://raw.githubusercontent.com/fcrre26/monitor/refs/heads/main/Cargo.toml -O Cargo.toml
 
 # 设置执行权限
 echo "设置权限..."
