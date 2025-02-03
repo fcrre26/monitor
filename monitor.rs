@@ -111,12 +111,16 @@ impl ConfigBuilder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ServerChanConfig {
     keys: Vec<String>,
+    alert_interval: u64,  // 新增
+    heartbeat_interval: u64,  // 新增
 }
 
 impl Default for ServerChanConfig {
     fn default() -> Self {
         Self {
             keys: Vec::new(),
+            alert_interval: 300,
+            heartbeat_interval: 3600,
         }
     }
 }
@@ -215,6 +219,7 @@ struct Metrics {
     missed_blocks: HashSet<u64>,
     processing_delays: Vec<Duration>,
     last_process_time: Instant,
+    retry_counts: AtomicUsize,
 }
 
 impl Default for Metrics {
@@ -225,6 +230,7 @@ impl Default for Metrics {
             missed_blocks: HashSet::new(),
             processing_delays: Vec::new(),
             last_process_time: Instant::now(),
+            retry_counts: AtomicUsize::new(0),
         }
     }
 }
@@ -275,8 +281,8 @@ impl CacheSystem {
     }
 
     async fn cleanup(&mut self) {
+        // 仅保留最近1小时的区块数据，其他缓存项使用LRU自动清理
         let now = SystemTime::now();
-        
         self.blocks.retain(|_, v| {
             v.block_time
                 .map(|t| now.duration_since(UNIX_EPOCH).unwrap().as_secs() - t < 3600)
@@ -465,6 +471,7 @@ struct TokenMonitor {
     proxy_pool: Arc<Mutex<ProxyPool>>,
     // 添加服务状态管理
     service_state: Arc<ServiceState>,
+    last_alert: tokio::sync::Mutex<SystemTime>,
 }
 
 impl Clone for TokenMonitor {
@@ -485,6 +492,7 @@ impl Clone for TokenMonitor {
             monitor_state: self.monitor_state.clone(),
             proxy_pool: self.proxy_pool.clone(),
             service_state: self.service_state.clone(),
+            last_alert: tokio::sync::Mutex::new(SystemTime::now()),
         }
     }
 }
@@ -592,6 +600,7 @@ struct ProxyPool {
     proxies: Vec<ProxyConfig>,
     current_index: usize,
     last_check: SystemTime,
+    health_status: DashMap<String, bool>, // 新增健康状态追踪
 }
 
 impl ProxyPool {
@@ -600,11 +609,18 @@ impl ProxyPool {
             proxies,
             current_index: 0,
             last_check: SystemTime::now(),
+            health_status: DashMap::new(),
         }
     }
 
     async fn get_next_proxy(&mut self) -> Option<reqwest::Proxy> {
+        if self.proxies.is_empty() {
+            return None;
+        }
+
         let proxy = &self.proxies[self.current_index];
+        self.current_index = (self.current_index + 1) % self.proxies.len();
+        
         let protocol_str = proxy.protocol.as_str();
         
         let proxy_url = format!(
@@ -623,41 +639,59 @@ impl ProxyPool {
     }
 
     async fn check_proxies(&mut self) {
-        let client = reqwest::Client::new();
-        let mut valid_proxies = Vec::new();
-
-        for proxy in &self.proxies {
-            let proxy_url = format!(
-                "http://{}:{}@{}:{}",
-                proxy.username,
-                proxy.password,
-                proxy.ip,
-                proxy.port
-            );
-
-            let proxy = match reqwest::Proxy::http(&proxy_url) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            let test_client = match client.clone()
-                .proxy(proxy)
-                .build() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            match test_client.get("https://api.mainnet-beta.solana.com")
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await {
-                Ok(_) => valid_proxies.push(proxy.clone()),
-                Err(_) => log::warn!("代理不可用: {}", proxy_url),
-            }
+        if self.proxies.is_empty() {
+            log::warn!("代理池为空，跳过健康检查");
+            return;
         }
 
-        self.proxies = valid_proxies;
+        let now = SystemTime::now();
+        let mut working_proxies = Vec::new();
+        
+        for proxy in &self.proxies {
+            // 添加超时和重试机制
+            let result = self.test_proxy(proxy).await;
+            match result {
+                Ok(true) => {
+                    working_proxies.push(proxy.clone());
+                },
+                Ok(false) => {
+                    log::warn!("代理 {} 检测失败", proxy.id);
+                },
+                Err(e) => {
+                    log::error!("代理检测错误: {}", e);
+                }
+            }
+        }
+        
+        self.proxies = working_proxies;
         self.current_index = 0;
+    }
+
+    pub async fn maintain(&mut self) {
+        if self.proxies.is_empty() {
+            return;
+        }
+        let now = SystemTime::now();
+        if now.duration_since(self.last_check).unwrap().as_secs() > 300 {
+            self.check_proxies().await;
+            self.last_check = now;
+        }
+    }
+
+    async fn test_proxy(&self, proxy: &ProxyConfig) -> Result<bool> {
+        let client = reqwest::Client::builder()
+            .proxy(self.build_proxy(proxy)?)
+            .timeout(Duration::from_secs(5))
+            .build()?;
+            
+        let response = client.get("https://api.mainnet-beta.solana.com")
+            .send()
+            .await?;
+            
+        let is_healthy = response.status().is_success();
+        self.health_status.insert(proxy.id.clone(), is_healthy);
+        
+        Ok(is_healthy)
     }
 }
 
@@ -726,6 +760,7 @@ impl TokenMonitor {
             monitor_state: Arc::new(Mutex::new(MonitorState::default())),
             proxy_pool,
             service_state: Arc::new(ServiceState::new()),
+            last_alert: tokio::sync::Mutex::new(SystemTime::now()),
         };
 
         monitor.init_rpc_nodes();
@@ -755,6 +790,7 @@ impl TokenMonitor {
             monitor_state: Arc::new(Mutex::new(monitor_state)),
             proxy_pool: monitor.proxy_pool,
             service_state: monitor.service_state,
+            last_alert: tokio::sync::Mutex::new(SystemTime::now()),
         })
     }
 
@@ -848,12 +884,12 @@ impl TokenMonitor {
 
     async fn start(&mut self) -> Result<()> {
         log::info!("Starting Solana token monitor...");
+        self.start_heartbeat().await; // 启动心跳任务
         
         let (block_tx, block_rx) = mpsc::channel(1000);
         let (token_tx, token_rx) = mpsc::channel(1000);
         
         self.start_worker_threads(block_rx, token_tx).await?;
-        
         self.monitor_blocks(block_tx).await
     }
 
@@ -881,6 +917,10 @@ impl TokenMonitor {
 
             let mut metrics = self.metrics.lock().await;
             metrics.processing_delays.push(start_time.elapsed());
+            metrics.retry_counts.fetch_add(
+                (3 - retries) as usize,  // 确保转换为usize
+                Ordering::Relaxed
+            );  // 错误方式
             
             time::sleep(Duration::from_millis(20)).await;
         }
@@ -901,6 +941,7 @@ impl TokenMonitor {
         while retries > 0 {
             match self.get_block(slot).await {
                 Ok(Some(block)) => {
+                    log::info!("成功获取区块 {} (经过 {} 次重试)", slot, 3 - retries);
                     for tx in block.transactions {
                         if let Some((mint, creator)) = self.extract_pump_info(&tx) {
                             token_tx.send((mint, creator)).await?;
@@ -911,10 +952,20 @@ impl TokenMonitor {
 
                     let mut metrics = self.metrics.lock().await;
                     metrics.processed_blocks += 1;
+                    let retry_count = 3 - retries;
+                    metrics.retry_counts.fetch_add(retry_count as usize, Ordering::Relaxed);
                     return Ok(());
                 },
                 Err(e) => {
+                    if retries == 1 { // 最后一次重试失败
+                        self.send_alert(
+                            "区块获取失败", 
+                            &format!("无法获取区块 {}\n错误: {}\n最后尝试时间: {}", 
+                                slot, e, chrono::Local::now().format("%H:%M:%S"))
+                        ).await;
+                    }
                     log::warn!("获取区块 {} 失败 (剩余重试次数: {}): {}", slot, retries-1, e);
+                    log::debug!("错误链: {:?}", e.chain().collect::<Vec<_>>());
                     retries -= 1;
                     tokio::time::sleep(Duration::from_secs(1 << (3 - retries))).await;
                 }
@@ -1259,7 +1310,13 @@ impl TokenMonitor {
         Ok(())
     }
 
-    async fn send_server_chan(&self, key: &str, message: &str, analysis: &TokenAnalysis) -> Result<()> {
+    async fn send_server_chan(&self, key: &str, message: &str, msg_type: &str) -> Result<()> {
+        let title = match msg_type {
+            "alert" => "⚠️ 系统异常告警",
+            "heartbeat" => "💓 监控系统心跳",
+            _ => "🆕 新代币预警",
+        };
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
@@ -1267,16 +1324,14 @@ impl TokenMonitor {
         let res = client
             .post(&format!("https://sctapi.ftqq.com/{}.send", key))
             .form(&[
-                ("title", "Solana新代币提醒"),
-                ("desp", &format!("{}\n\n**合约地址(点击复制)**\n```\n{}\n```", 
-                    message, 
-                    analysis.token_info.mint)),
+                ("title", title),
+                ("desp", &format!("```\n{}\n```", message)),
             ])
             .send()
             .await?;
             
         if !res.status().is_success() {
-            return Err(anyhow!("ServerChan push failed: {}", res.text().await?));
+            return Err(anyhow!("推送失败: {}", res.text().await?));
         }
         
         Ok(())
@@ -1806,8 +1861,8 @@ r#"🔗 快速链接 (点击复制)
         running: Arc<AtomicBool>,
         last_error: Arc<Mutex<Option<String>>>,
         start_time: SystemTime,
-        processed_blocks: AtomicUsize,
-        processed_tokens: AtomicUsize,
+        processed_blocks: Arc<AtomicUsize>,
+        processed_tokens: Arc<AtomicUsize>,
     }
 
     impl ServiceState {
@@ -1816,8 +1871,8 @@ r#"🔗 快速链接 (点击复制)
                 running: Arc::new(AtomicBool::new(false)),
                 last_error: Arc::new(Mutex::new(None)),
                 start_time: SystemTime::now(),
-                processed_blocks: AtomicUsize::new(0),
-                processed_tokens: AtomicUsize::new(0),
+                processed_blocks: Arc::new(AtomicUsize::new(0)),
+                processed_tokens: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -1841,6 +1896,19 @@ r#"🔗 快速链接 (点击复制)
         
         // 启动指标收集
         self.start_metrics_collection().await?;
+        
+        // 启动心跳推送
+        self.start_heartbeat();
+        
+        // 启动代理维护任务
+        let proxy_pool = self.proxy_pool.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                proxy_pool.lock().await.maintain().await;
+            }
+        });
         
         Ok(())
     }
@@ -2195,6 +2263,57 @@ r#"🔗 快速链接 (点击复制)
         format!("{}...{}", 
             &addr_str[..4], 
             &addr_str[addr_str.len()-4..])
+    }
+
+    async fn send_alert(&self, title: &str, content: &str) {
+        let mut last_alert = self.last_alert.lock().await;
+        if last_alert.elapsed().unwrap().as_secs() < 300 { // 5分钟间隔
+            return;
+        }
+        
+        for key in &self.config.serverchan.keys {
+            let message = format!("🚨 {} 🚨\n\n{}", title, content);
+            if let Err(e) = self.send_server_chan(key, &message, "alert").await {
+                log::error!("告警推送失败: {}", e);
+            }
+        }
+        *last_alert = SystemTime::now();
+    }
+
+    async fn start_heartbeat(&self) {
+        let interval = Duration::from_secs(self.config.serverchan.heartbeat_interval);
+        let mut interval = time::interval(interval);
+        loop {
+            interval.tick().await;
+            self.send_heartbeat().await;
+        }
+    }
+
+    async fn send_heartbeat(&self) {
+        let state = self.monitor_state.lock().await;
+        let metrics = self.metrics.lock().await;
+        
+        let message = format!(
+            "💓 系统心跳 | 运行状态正常\n\
+            ━━━━━━━━━━━━━━━━━━━━━━\n\
+            ▶ 运行时长: {:.1} 小时\n\
+            ▶ 处理区块: {}\n\
+            ▶ 监控代币: {}\n\
+            ▶ 节点状态: {}/{} 正常\n\
+            ▶ 最后异常: {}",
+            state.start_time.elapsed().unwrap().as_secs_f64() / 3600.0,
+            metrics.processed_blocks,
+            state.processed_tokens,
+            self.rpc_pool.health_status.iter().filter(|v| *v.value()).count(),
+            self.rpc_pool.clients.len(),
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
+
+        for key in &self.config.serverchan.keys {
+            if let Err(e) = self.send_server_chan(key, &message, "heartbeat").await {
+                log::error!("心跳推送失败: {}", e);
+            }
+        }
     }
 }
 
