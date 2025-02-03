@@ -290,11 +290,10 @@ impl CacheSystem {
     }
 
     async fn cleanup(&mut self) {
-        // 仅保留最近1小时的区块数据，其他缓存项使用LRU自动清理
         let now = SystemTime::now();
         self.blocks.retain(|_, v| {
             v.block_time
-                .map(|t| now.duration_since(UNIX_EPOCH).unwrap().as_secs() - t < 3600)
+                .map(|t| now.duration_since(UNIX_EPOCH).unwrap().as_secs() - t as u64 < 3600)
                 .unwrap_or(false)
         });
     }
@@ -524,7 +523,7 @@ impl Clone for TokenMonitor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FundingChain {
+pub struct FundingChain {
     pub total_amount: f64,
     pub transfers: Vec<Transfer>,
     pub risk_level: u8,
@@ -887,35 +886,9 @@ impl TokenMonitor {
     }
 
     async fn process_block(&self, slot: u64, token_tx: &mpsc::Sender<Pubkey>) -> Result<()> {
-        let mut retries = 3;
-        let mut retry_delay = 1;
-        let mut metrics = self.metrics.lock().await;
-        
-        while retries > 0 {
-            let client = self.rpc_pool.get_healthy_client().unwrap_or_else(|| self.rpc_pool.clients[0].clone());
-            match client.get_block_with_encoding(slot, UiTransactionEncoding::Base64).await {
-                Ok(block) => {
-                    metrics.processed_blocks += 1;
-                    if let Some(txs) = &block.transactions {
-                        metrics.processed_txs += txs.len() as u64;
-                        for tx in txs {
-                            if let Some((mint, _creator)) = self.extract_pump_info(&tx) {
-                                let _ = token_tx.send(mint).await;
-                            }
-                        }
-                    }
-                    break;
-                },
-                Err(e) => {
-                    retries -= 1;
-                    let retries_remaining: i32 = retries; // 添加类型注解
-                    metrics.retry_counts.fetch_add(retries_remaining as usize, Ordering::Relaxed);
-                    log::error!("获取区块 {} 失败: {}, 剩余重试次数: {}", slot, e, retries_remaining);
-                    tokio::time::sleep(Duration::from_secs(retry_delay)).await;
-                    retry_delay *= 2;
-                }
-            }
-        }
+        let client = self.rpc_pool.get_healthy_client().unwrap_or_else(|| self.rpc_pool.clients[0].clone());
+        let block = client.get_block(slot).await?; // 正确使用 .await
+        self.handle_block(block).await?;
         Ok(())
     }
 
@@ -2405,18 +2378,24 @@ r#"🔗 快速链接 (点击复制)
         format!("{}...{}", &addr_str[..4], &addr_str[addr_str.len()-4..])
     }
 
-    async fn get_block(&self, slot: u64) -> Result<EncodedConfirmedBlock> {
-        let mut retries_used = 0;  // 添加变量定义
-        loop {
-            let client = self.get_next_rpc_client();
-            match client.get_block(slot).await {
-                Ok(block) => return Ok(block),
+    async fn get_block(&self, slot: u64) -> Result<Option<EncodedConfirmedBlock>> {
+        let mut last_error = None;
+        for client in &self.rpc_pool.clients {
+            match client.get_block_with_encoding(
+                slot,
+                UiTransactionEncoding::Json,
+            ).await {
+                Ok(block) => return Ok(Some(block)),
                 Err(e) => {
-                    retries_used += 1;
-                    let retries_remaining = 3 - retries_used;
-                    // ...
+                    log::warn!("RPC client error: {}", e);
+                    last_error = Some(e);
                 }
             }
+        }
+        if let Some(e) = last_error {
+            Err(anyhow!("All RPC clients failed: {}", e))
+        } else {
+            Ok(None)
         }
     }
 
@@ -2936,7 +2915,7 @@ pub struct PriceTrendAnalysis {
     pub trend_direction: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComprehensiveScore {
     pub total_score: u8,
     pub risk_score: u8,
@@ -2944,7 +2923,7 @@ pub struct ComprehensiveScore {
     pub market_score: u8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HolderCategory {
     pub address: Pubkey,
     pub balance: f64,
