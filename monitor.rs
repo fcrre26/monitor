@@ -1,54 +1,49 @@
 #![allow(unused_imports)]
 
-extern crate solana_client;
-extern crate solana_sdk;
-extern crate solana_transaction_status;
-extern crate tokio;
-extern crate log4rs;
-extern crate dirs;
-extern crate serde_json;
-extern crate chrono;
-extern crate env_logger;
-extern crate colored;
+use std::fs;
+use std::str::FromStr;
+use colored::Colorize;
+use anyhow::{Result, anyhow};
+use log;
+use reqwest;
+use serde::{Deserialize, Serialize};
+use log4rs::config::LevelFilter;
+use lru::LruCache;
+use dashmap::DashMap;
+use futures::future::join_all;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, AtomicF64, Ordering};
 
-use {
-    anyhow::Result,
-    log,
-    reqwest,
-    serde::{Deserialize, Serialize},
-    solana_client::rpc_client::RpcClient,
-    solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey},
-    solana_transaction_status::{
-        EncodedConfirmedBlock,
-        EncodedTransaction,
-        UiTransactionEncoding,
-    },
-    std::{
-        collections::{HashMap, HashSet},
-        sync::Arc,
-        time::{Duration, SystemTime, Instant},
-        fs::File,
-        io::Read,
-        process,
-        path::Path,
-    },
-    tokio::{
-        sync::{mpsc, Mutex},
-        time,
-    },
-    log4rs::{
-        append::rolling_file::{
-            RollingFileAppender, 
-            policy::compound::{
-                CompoundPolicy,
-                trigger::size::SizeTrigger,
-                roll::fixed_window::FixedWindowRoller,
-            },
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
+use solana_transaction_status::{
+    EncodedConfirmedBlock,
+    EncodedTransaction,
+    UiTransactionEncoding,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, SystemTime, Instant},
+    io::Read,
+    process,
+    path::Path,
+};
+use tokio::{
+    sync::{mpsc, Mutex},
+    time,
+};
+use log4rs::{
+    append::rolling_file::{
+        RollingFileAppender, 
+        policy::compound::{
+            CompoundPolicy,
+            trigger::size::SizeTrigger,
+            roll::fixed_window::FixedWindowRoller,
         },
-        config::{Appender, Config, Root},
-        encode::pattern::PatternEncoder,
     },
-    colored::*,
+    config::{Appender, Config, Root},
+    encode::pattern::PatternEncoder,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,30 +63,46 @@ impl Config {
 
 #[derive(Default)]
 struct ConfigBuilder {
-    appenders: Vec<Appender>,
-    root: Option<Root>,
+    api_keys: Vec<String>,
+    serverchan: Option<ServerChanConfig>,
+    wcf: Option<WeChatFerryConfig>,
+    proxy: Option<ProxyConfig>,
+    rpc_nodes: HashMap<String, RpcNodeConfig>,
 }
 
 impl ConfigBuilder {
-    fn appender(mut self, appender: Appender) -> Self {
-        self.appenders.push(appender);
+    fn api_key(mut self, key: String) -> Self {
+        self.api_keys.push(key);
         self
     }
 
-    fn build(self, root: Root) -> Result<Config> {
-        // 实现构建逻辑
+    fn serverchan(mut self, config: ServerChanConfig) -> Self {
+        self.serverchan = Some(config);
+        self
+    }
+
+    fn wcf(mut self, config: WeChatFerryConfig) -> Self {
+        self.wcf = Some(config);
+        self
+    }
+
+    fn proxy(mut self, config: ProxyConfig) -> Self {
+        self.proxy = Some(config);
+        self
+    }
+
+    fn rpc_node(mut self, url: String, config: RpcNodeConfig) -> Self {
+        self.rpc_nodes.insert(url, config);
+        self
+    }
+
+    fn build(self) -> Result<Config> {
         Ok(Config {
-            api_keys: Vec::new(),
-            serverchan: ServerChanConfig { keys: Vec::new() },
-            wcf: WeChatFerryConfig { groups: Vec::new() },
-            proxy: ProxyConfig {
-                enabled: false,
-                ip: String::new(),
-                port: 0,
-                username: String::new(),
-                password: String::new(),
-            },
-            rpc_nodes: HashMap::new(),
+            api_keys: self.api_keys,
+            serverchan: self.serverchan.unwrap_or_default(),
+            wcf: self.wcf.unwrap_or_default(),
+            proxy: self.proxy.unwrap_or_default(),
+            rpc_nodes: self.rpc_nodes,
         })
     }
 }
@@ -101,9 +112,25 @@ struct ServerChanConfig {
     keys: Vec<String>,
 }
 
+impl Default for ServerChanConfig {
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WeChatFerryConfig {
     groups: Vec<WeChatGroup>,
+}
+
+impl Default for WeChatFerryConfig {
+    fn default() -> Self {
+        Self {
+            groups: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +146,18 @@ struct ProxyConfig {
     port: u16,
     username: String,
     password: String,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ip: String::new(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,19 +188,91 @@ impl Default for Metrics {
     }
 }
 
+struct RpcPool {
+    clients: Vec<Arc<RpcClient>>,
+    health_status: DashMap<String, bool>,
+    current_index: AtomicUsize,
+    metrics: Arc<RpcMetrics>,
+}
+
+impl RpcPool {
+    async fn get_healthy_client(&self) -> Option<Arc<RpcClient>> {
+        let start_idx = self.current_index.load(Ordering::Relaxed);
+        for i in 0..self.clients.len() {
+            let idx = (start_idx + i) % self.clients.len();
+            if self.health_status.get(&self.clients[idx].url()).map_or(true, |v| *v) {
+                return Some(self.clients[idx].clone());
+            }
+        }
+        None
+    }
+}
+
+struct CacheSystem {
+    blocks: DashMap<u64, EncodedConfirmedBlock>,
+    token_info: LruCache<Pubkey, (TokenInfo, SystemTime)>,
+    creator_history: DashMap<Pubkey, (CreatorHistory, SystemTime)>,
+    fund_flow: DashMap<Pubkey, (Vec<FundingChain>, SystemTime)>,
+    transactions: LruCache<String, EncodedTransaction>,
+}
+
+struct AsyncLogger {
+    sender: mpsc::Sender<LogMessage>,
+}
+
+impl AsyncLogger {
+    async fn log(&self, level: log::Level, message: impl Into<String>) {
+        if let Err(e) = self.sender.send(LogMessage {
+            level,
+            content: message.into(),
+            timestamp: SystemTime::now(),
+        }).await {
+            eprintln!("Failed to send log: {}", e);
+        }
+    }
+}
+
+struct SmartBatcher {
+    batch_size: AtomicUsize,
+    load_metrics: Arc<LoadMetrics>,
+}
+
 struct TokenMonitor {
     config: Config,
-    rpc_clients: Vec<Arc<RpcClient>>,
+    rpc_pool: Arc<RpcPool>,
+    cache: Arc<Mutex<CacheSystem>>,
+    logger: Arc<AsyncLogger>,
+    batcher: Arc<SmartBatcher>,
     metrics: Arc<Mutex<Metrics>>,
     pump_program: Pubkey,
     client: reqwest::Client,
     current_api_key: Arc<Mutex<usize>>,
-    request_counts: HashMap<String, u32>,
-    last_reset: HashMap<String, SystemTime>,
-    cache: Arc<Mutex<Cache>>,
+    request_counts: DashMap<String, u32>,
+    last_reset: DashMap<String, SystemTime>,
     watch_addresses: HashSet<String>,
     monitor_state: Arc<Mutex<MonitorState>>,
     proxy_pool: Arc<Mutex<ProxyPool>>,
+}
+
+impl Clone for TokenMonitor {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            rpc_pool: self.rpc_pool.clone(),
+            cache: self.cache.clone(),
+            logger: self.logger.clone(),
+            batcher: self.batcher.clone(),
+            metrics: self.metrics.clone(),
+            pump_program: self.pump_program,
+            client: self.client.clone(),
+            current_api_key: self.current_api_key.clone(),
+            request_counts: self.request_counts.clone(),
+            last_reset: self.last_reset.clone(),
+            watch_addresses: self.watch_addresses.clone(),
+            monitor_state: self.monitor_state.clone(),
+            proxy_pool: self.proxy_pool.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -205,7 +316,19 @@ struct TokenInfo {
 
 impl From<TokenResponse> for TokenInfo {
     fn from(response: TokenResponse) -> Self {
-        response.data
+        TokenInfo {
+            mint: response.data.mint,
+            name: response.data.name,
+            symbol: response.data.symbol,
+            market_cap: response.data.market_cap,
+            liquidity: response.data.liquidity,
+            holder_count: response.data.holder_count,
+            holder_concentration: response.data.holder_concentration,
+            verified: response.data.verified,
+            price: response.data.price,
+            supply: response.data.supply,
+            creator: response.data.creator,
+        }
     }
 }
 
@@ -258,6 +381,14 @@ struct ProxyPool {
 }
 
 impl ProxyPool {
+    fn new(proxies: Vec<ProxyConfig>) -> Self {
+        Self {
+            proxies,
+            current_index: 0,
+            last_check: SystemTime::now(),
+        }
+    }
+
     async fn get_next_proxy(&mut self) -> Option<reqwest::Proxy> {
         if self.proxies.is_empty() {
             return None;
@@ -319,20 +450,20 @@ impl TokenMonitor {
     const BLOCK_BATCH_SIZE: usize = 100;
     const WORKER_THREADS: usize = 20;
 
-    fn get_proxy(&self) -> Option<reqwest::Proxy> {
-        if !self.config.proxy.enabled {
+    fn get_proxy(config: &ProxyConfig) -> Option<reqwest::Proxy> {
+        if !config.enabled {
             return None;
         }
 
         let proxy_url = format!(
             "http://{}:{}@{}:{}",
-            self.config.proxy.username,
-            self.config.proxy.password,
-            self.config.proxy.ip,
-            self.config.proxy.port
+            config.username,
+            config.password,
+            config.ip,
+            config.port
         );
 
-        Some(reqwest::Proxy::http(&proxy_url).unwrap())
+        reqwest::Proxy::http(&proxy_url).ok()
     }
 
     async fn new() -> Result<Self> {
@@ -358,14 +489,32 @@ impl TokenMonitor {
 
         let mut monitor = Self {
             config: config.clone(),
-            rpc_clients: Vec::new(),
+            rpc_pool: Arc::new(RpcPool {
+                clients: Vec::new(),
+                health_status: DashMap::new(),
+                current_index: AtomicUsize::new(0),
+                metrics: Arc::new(RpcMetrics::default()),
+            }),
+            cache: Arc::new(Mutex::new(CacheSystem {
+                blocks: DashMap::new(),
+                token_info: LruCache::new(100),
+                creator_history: DashMap::new(),
+                fund_flow: DashMap::new(),
+                transactions: LruCache::new(100),
+            })),
+            logger: Arc::new(AsyncLogger {
+                sender: mpsc::channel(1000).0,
+            }),
+            batcher: Arc::new(SmartBatcher {
+                batch_size: AtomicUsize::new(0),
+                load_metrics: Arc::new(LoadMetrics::default()),
+            }),
             metrics: Arc::new(Mutex::new(Metrics::default())),
             pump_program: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ35MKDfgCcMKJ".parse()?,
             client,
             current_api_key: Arc::new(Mutex::new(0)),
-            request_counts: HashMap::new(),
-            last_reset: HashMap::new(),
-            cache: Arc::new(Mutex::new(Cache::default())),
+            request_counts: DashMap::new(),
+            last_reset: DashMap::new(),
             watch_addresses: HashSet::new(),
             monitor_state: Arc::new(Mutex::new(MonitorState::default())),
             proxy_pool,
@@ -384,14 +533,16 @@ impl TokenMonitor {
         
         Ok(Self {
             config,
-            rpc_clients: monitor.rpc_clients,
+            rpc_pool: monitor.rpc_pool,
+            cache: monitor.cache,
+            logger: monitor.logger,
+            batcher: monitor.batcher,
             metrics: monitor.metrics,
             pump_program: monitor.pump_program,
             client: monitor.client,
             current_api_key: monitor.current_api_key,
             request_counts: monitor.request_counts,
             last_reset: monitor.last_reset,
-            cache: monitor.cache,
             watch_addresses,
             monitor_state: Arc::new(Mutex::new(monitor_state)),
             proxy_pool: monitor.proxy_pool,
@@ -408,7 +559,7 @@ impl TokenMonitor {
         ];
 
         for url in default_nodes {
-            self.rpc_clients.push(Arc::new(RpcClient::new_with_commitment(
+            self.rpc_pool.clients.push(Arc::new(RpcClient::new_with_commitment(
                 url.to_string(),
                 CommitmentConfig::confirmed(),
             )));
@@ -479,7 +630,8 @@ impl TokenMonitor {
     fn load_config() -> Result<Config> {
         let config_path = dirs::home_dir()
             .ok_or_else(|| anyhow!("Cannot find home directory"))?
-            .join(".solana_pump.cfg");
+            .join(".solana_pump")
+            .join("config.json");
 
         let config_str = fs::read_to_string(config_path)?;
         Ok(serde_json::from_str(&config_str)?)
@@ -526,7 +678,7 @@ impl TokenMonitor {
     }
 
     async fn get_current_slot(&self) -> Result<u64> {
-        for client in &self.rpc_clients {
+        for client in &self.rpc_pool.clients {
             match client.get_slot().await {
                 Ok(slot) => return Ok(slot),
                 Err(e) => log::warn!("RPC client error: {}", e),
@@ -567,16 +719,24 @@ impl TokenMonitor {
     }
 
     async fn get_block(&self, slot: u64) -> Result<Option<EncodedConfirmedBlock>> {
-        for client in &self.rpc_clients {
+        let mut last_error = None;
+        for client in &self.rpc_pool.clients {
             match client.get_block_with_encoding(
                 slot,
-                solana_transaction_status::UiTransactionEncoding::Json,
+                UiTransactionEncoding::Json,
             ).await {
                 Ok(block) => return Ok(Some(block)),
-                Err(e) => log::warn!("Failed to get block from RPC: {}", e),
+                Err(e) => {
+                    log::warn!("RPC client error: {}", e);
+                    last_error = Some(e);
+                }
             }
         }
-        Ok(None)
+        if let Some(e) = last_error {
+            Err(anyhow!("All RPC clients failed: {}", e))
+        } else {
+            Ok(None)
+        }
     }
 
     fn extract_pump_info(&self, tx: &EncodedTransaction) -> Option<(Pubkey, Pubkey)> {
@@ -623,7 +783,7 @@ impl TokenMonitor {
 
         let token_info = token_info?;
         let creator_history = creator_history?;
-        let fund_flow = fund_flow?;
+        let fund_flow = fund_flow?.to_vec();
         
         let risk_score = self.calculate_risk_score(&token_info, &creator_history, &fund_flow);
         
@@ -825,7 +985,7 @@ impl TokenMonitor {
     }
 
     async fn calculate_wallet_age(&self, address: &Pubkey) -> Result<f64> {
-        let client = &self.rpc_clients[0];
+        let client = &self.rpc_pool.clients[0];
         
         let signatures = client
             .get_signatures_for_address(address)
@@ -880,7 +1040,7 @@ impl TokenMonitor {
         let message = self.format_message(analysis);
         
         for key in &self.config.serverchan.keys {
-            if let Err(e) = self.send_server_chan(key, &message).await {
+            if let Err(e) = self.send_server_chan(key, &message, analysis).await {
                 log::error!("ServerChan push failed: {}", e);
             }
         }
@@ -894,7 +1054,7 @@ impl TokenMonitor {
         Ok(())
     }
 
-    async fn send_server_chan(&self, key: &str, message: &str) -> Result<()> {
+    async fn send_server_chan(&self, key: &str, message: &str, analysis: &TokenAnalysis) -> Result<()> {
         let res = self.client
             .post(&format!("https://sctapi.ftqq.com/{}.send", key))
             .form(&[
@@ -920,13 +1080,13 @@ impl TokenMonitor {
 
     fn format_message(&self, analysis: &TokenAnalysis) -> String {
         let mut msg = vec![
-            "┏━━━━━━━━━━━━━━━━━━━━━ 🔔 发现新代币 (UTC+8) ━━━━━━━━━━━━━━━━━━━━━┓".to_string(),
+            "┏━━━━━━━━━━━━━━━━━━━━━ 发现新代币 (UTC+8) ━━━━━━━━━━━━━━━━━━━━━┓".to_string(),
             "".to_string(),
             "📋 合约信息".to_string(),
             format!("┣━ CA: {}", analysis.token_info.mint),
             format!("┣━ 创建者: {}", analysis.token_info.creator),
             format!(
-                "┗━ 钱包状态: {} | 钱包年龄: {:.1f} 天",
+                "┗━ 钱包状态: {} | 钱包年龄: {:.1} 天",
                 if analysis.is_new_wallet { "🆕 新钱包" } else { "📅 老钱包" },
                 analysis.wallet_age
             ),
@@ -1639,12 +1799,14 @@ impl TokenMonitor {
                                                         5,
                                                     )?
                                             ),
-                                        )),
-                                    )?
+                                        )
+                                    )
+                                )
                             )
                         )
                     )
-                    .build(Root::builder().appender("rolling").build(level_filter))?;
+                )?
+                .build(Root::builder().appender("rolling").build(level_filter)))?;
 
                 log4rs::init_config(config)?;
                 println!("日志级别已更新");
@@ -1766,6 +1928,45 @@ impl TokenMonitor {
         if self.config.serverchan.keys.is_empty() {
             println!("{}", "没有配置Server酱密钥".yellow());
         }
+    }
+
+    fn init_logger() -> Result<()> {
+        let home_dir = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?;
+        let log_dir = home_dir.join(".solana").join("pump").join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+        
+        let config = log4rs::config::Config::builder()
+            .appender(
+                Appender::builder().build(
+                    "rolling",
+                    Box::new(
+                        RollingFileAppender::builder()
+                            .encoder(Box::new(PatternEncoder::new("{d} - {l} - {m}{n}")))
+                            .build(
+                                log_dir.join("solana_pump.log"),
+                                Box::new(
+                                    CompoundPolicy::new(
+                                        Box::new(SizeTrigger::new(10 * 1024 * 1024)),
+                                        Box::new(
+                                            FixedWindowRoller::builder()
+                                                .build(
+                                                    log_dir.join("solana_pump.{}.log").to_str().unwrap(),
+                                                    5,
+                                                )?
+                                            ),
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    ),
+                )
+            )?
+            .build(Root::builder().appender("rolling").build(LevelFilter::Info)))?;
+
+        log4rs::init_config(config)?;
+        Ok(())
     }
 }
 
