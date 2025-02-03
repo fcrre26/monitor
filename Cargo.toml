@@ -24,6 +24,7 @@ dashmap = "5.5"
 thiserror = "1.0"
 atomic_float = "0.1"
 ctrlc = "3.4"
+bincode = "1.3"
 
 [profile.release]
 opt-level = 3
