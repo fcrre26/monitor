@@ -1781,32 +1781,31 @@ impl TokenMonitor {
                 let log_dir = dirs::home_dir()?.join(".solana_pump/logs");
                 let config = Config::builder()
                     .appender(
-                        Appender::builder().build(
-                            "rolling",
-                            Box::new(
-                                RollingFileAppender::builder()
-                                    .encoder(Box::new(PatternEncoder::new(
-                                        "{d(%Y-%m-%d %H:%M:%S)} {l} [{T}] {m}{n}"
-                                    )))
-                                    .build(
-                                        log_dir.join("solana_pump.log"),
-                                        Box::new(CompoundPolicy::new(
-                                            Box::new(SizeTrigger::new(10 * 1024 * 1024)),
-                                            Box::new(
-                                                FixedWindowRoller::builder()
-                                                    .build(
-                                                        log_dir.join("solana_pump.{}.log").to_str().unwrap(),
-                                                        5,
-                                                    )?
-                                            ),
-                                        )
-                                    )
-                                )
+                        Appender::builder()
+                            .build(
+                                "rolling",
+                                Box::new(
+                                    RollingFileAppender::builder()
+                                        .encoder(Box::new(PatternEncoder::new(
+                                            "{d(%Y-%m-%d %H:%M:%S)} {l} [{T}] {m}{n}"
+                                        )))
+                                        .build(
+                                            log_dir.join("solana_pump.log"),
+                                            Box::new(CompoundPolicy::new(
+                                                Box::new(SizeTrigger::new(10 * 1024 * 1024)),
+                                                Box::new(
+                                                    FixedWindowRoller::builder()
+                                                        .build(
+                                                            log_dir.join("solana_pump.{}.log").to_str().unwrap(),
+                                                            5,
+                                                        )?
+                                                ),
+                                            ))
+                                        )?
                             )
                         )
-                    )
-                )?
-                .build(Root::builder().appender("rolling").build(level_filter)))?;
+                    )?
+                    .build(Root::builder().appender("rolling").build(level_filter)))?;
 
                 log4rs::init_config(config)?;
                 println!("日志级别已更新");
