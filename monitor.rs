@@ -221,12 +221,15 @@ pub struct RpcManager {
     default_nodes: Vec<RpcNodeConfig>,
 }
 
-#[derive(Debug, Default)]
-pub struct MonitorState {
-    pub last_slot: u64,
-    pub processed_blocks: u64,
-    pub processed_tokens: u64,
-    pub start_time: SystemTime,
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct MonitorState {
+    last_slot: u64,
+    processed_blocks: u64,
+    processed_tokens: u64,
+    alerts: Vec<Alert>,
+    watch_addresses: HashSet<String>,
+    metrics: MonitorMetrics,
+    start_time: SystemTime,
 }
 
 #[derive(Debug, Default)]
@@ -307,20 +310,25 @@ impl CacheSystem {
         self.token_info.put(mint, (info.clone(), SystemTime::now()));
         Ok(info)
     }
+
+    async fn fetch_token_info(&self, mint: &Pubkey) -> Result<TokenInfo> {
+        // 实现获取 token 信息的逻辑
+    }
 }
 
 //===========================================
 // 日志系统模块
 //===========================================
-struct AsyncLogger {
-    sender: mpsc::Sender<LogMessage>,
-}
-
 #[derive(Debug)]
 struct LogMessage {
     level: log::Level,
     content: String,
     timestamp: SystemTime,
+}
+
+#[derive(Debug)]
+struct AsyncLogger {
+    sender: mpsc::Sender<LogMessage>,
 }
 
 impl AsyncLogger {
@@ -387,6 +395,7 @@ pub struct MonitorMetrics {
 //===========================================
 // 智能批处理模块
 //===========================================
+#[derive(Debug)]
 struct SmartBatcher {
     batch_size: AtomicUsize,
     load_metrics: Arc<LoadMetrics>,
@@ -887,7 +896,7 @@ impl TokenMonitor {
 
     async fn process_block(&self, slot: u64, token_tx: &mpsc::Sender<Pubkey>) -> Result<()> {
         let client = self.rpc_pool.get_healthy_client().unwrap_or_else(|| self.rpc_pool.clients[0].clone());
-        let block = client.get_block(slot).await?; // 正确使用 .await
+        let block = client.get_block(slot)?; // 正确使用 .await
         self.handle_block(block).await?;
         Ok(())
     }
@@ -1097,16 +1106,12 @@ impl TokenMonitor {
 
             let success_tokens = self.check_address_success_tokens(&source).await?;
             let mut chain = FundingChain {
-                transfers: vec![Transfer {
-                    source,
-                    amount: transfer.amount,
-                    timestamp: transfer.timestamp,
-                }],
-                total_amount: transfer.amount,
+                total_amount: 0.0,
+                transfers: vec![],
                 risk_level: 0,
-                source_wallet: "".to_string(),
-                intermediate_wallet: "".to_string(),
-                destination_wallet: "".to_string(),
+                source_wallet: String::new(),
+                intermediate_wallet: String::new(),
+                destination_wallet: String::new(),
             };
 
             let sub_chains = self.trace_fund_flow_recursive(&source, visited, depth + 1, max_depth).await?;
@@ -1663,23 +1668,12 @@ r#"🔗 快速链接 (点击复制)
             },
             fund_flow: vec![
                 FundingChain {
-                    transfers: vec![
-                        Transfer {
-                            source: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".parse().unwrap(),
-                            amount: 1250.5,
-                            timestamp: 1711008000, // 2024-03-21 12:00:00
-                            success_tokens: Some(vec![
-                                SuccessToken {
-                                    address: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".parse().unwrap(),
-                                    symbol: "SAMO".to_string(),
-                                    name: "Samoyedcoin".to_string(),
-                                    market_cap: 25_000_000.0,
-                                    created_at: 1640995200,
-                                }
-                            ]),
-                        }
-                    ],
-                    total_amount: 1250.5,
+                    total_amount: 0.0,
+                    transfers: vec![],
+                    risk_level: 0,
+                    source_wallet: String::new(),
+                    intermediate_wallet: String::new(),
+                    destination_wallet: String::new(),
                 }
             ],
             risk_score: 35,
@@ -1954,16 +1948,12 @@ r#"🔗 快速链接 (点击复制)
             }
             
             let mut chain = FundingChain {
-                transfers: vec![Transfer {
-                    source: activity.source,
-                    amount: activity.amount,
-                    timestamp: activity.timestamp,
-                }],
-                total_amount: activity.amount,
+                total_amount: 0.0,
+                transfers: vec![],
                 risk_level: 0,
-                source_wallet: "".to_string(),
-                intermediate_wallet: "".to_string(),
-                destination_wallet: "".to_string(),
+                source_wallet: String::new(),
+                intermediate_wallet: String::new(),
+                destination_wallet: String::new(),
             };
             
             // 递归追踪资金流向
@@ -2522,6 +2512,10 @@ r#"🔗 快速链接 (点击复制)
         fn add_client(&self, client: RpcClient) {
             let mut clients = self.clients.lock().unwrap();
             clients.push(Arc::new(client));
+        }
+
+        fn get_healthy_client(&self) -> Option<Arc<RpcClient>> {
+            // 实现获取健康客户端的逻辑
         }
     }
 
