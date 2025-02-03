@@ -24,6 +24,7 @@ fi
 # 创建目录
 mkdir -p $WORK_DIR
 mkdir -p $INSTALL_DIR/{bin,logs,config}
+mkdir -p $WORK_DIR/src
 cd $WORK_DIR
 
 # 下载文件
