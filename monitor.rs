@@ -49,6 +49,7 @@ use log4rs::{
     append::console::ConsoleAppender,
 };
 use std::sync::Mutex as StdMutex;
+use serde_json::json;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -228,12 +229,20 @@ pub struct MonitorState {
     pub start_time: SystemTime,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Metrics {
     pub processed_blocks: u64,
     pub processed_txs: u64,
-    pub missed_blocks: HashSet<u64>,
-    pub processing_delays: Vec<Duration>,
+    pub missed_blocks: u64,
+    pub processing_delays: Vec<u64>,
+    pub last_process_time: Instant,
+    pub retry_counts: AtomicUsize,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Debug)]
@@ -859,7 +868,7 @@ impl TokenMonitor {
             }
 
             let mut metrics = self.metrics.lock().await;
-            metrics.processing_delays.push(start_time.elapsed());
+            metrics.processing_delays.push(start_time.elapsed().as_millis() as u64);
             let retries_remaining = 3 - retries_used;
             metrics.retry_counts.fetch_add(retries_remaining as usize, Ordering::Relaxed);
             
@@ -877,42 +886,37 @@ impl TokenMonitor {
         Err(anyhow!("All RPC clients failed"))
     }
 
-    async fn process_block(&self, slot: u64, token_tx: &mpsc::Sender<(Pubkey, Pubkey)>) -> Result<()> {
+    async fn process_block(&self, slot: u64, token_tx: &mpsc::Sender<Pubkey>) -> Result<()> {
         let mut retries = 3;
+        let mut retry_delay = 1;
+        let mut metrics = self.metrics.lock().await;
+        
         while retries > 0 {
-            match self.get_block(slot).await {
-                Ok(Some(block)) => {
-                    log::info!("成功获取区块 {} (经过 {} 次重试)", slot, 3 - retries);
-                    for tx in block.transactions {
-                        if let Some((mint, creator)) = self.extract_pump_info(&tx) {
-                            token_tx.send((mint, creator)).await?;
-                            let mut metrics = self.metrics.lock().await;
-                            metrics.processed_txs += 1;
+            let client = self.rpc_pool.get_healthy_client().unwrap_or_else(|| self.rpc_pool.clients[0].clone());
+            match client.get_block_with_encoding(slot, UiTransactionEncoding::Base64).await {
+                Ok(block) => {
+                    metrics.processed_blocks += 1;
+                    if let Some(txs) = &block.transactions {
+                        metrics.processed_txs += txs.len() as u64;
+                        for tx in txs {
+                            if let Some((mint, _creator)) = self.extract_pump_info(&tx) {
+                                let _ = token_tx.send(mint).await;
+                            }
                         }
                     }
-
-                    let mut metrics = self.metrics.lock().await;
-                    metrics.processed_blocks += 1;
-                    let retry_count = 3 - retries;
-                    metrics.retry_counts.fetch_add(retry_count as usize, Ordering::Relaxed);
-                    return Ok(());
+                    break;
                 },
                 Err(e) => {
-                    if retries == 1 { // 最后一次重试失败
-                        self.send_alert(
-                            "区块获取失败", 
-                            &format!("无法获取区块 {}\n错误: {}\n最后尝试时间: {}", 
-                                slot, e, chrono::Local::now().format("%H:%M:%S"))
-                        ).await;
-                    }
-                    log::warn!("获取区块 {} 失败 (剩余重试次数: {}): {}", slot, retries-1, e);
-                    log::debug!("错误链: {:?}", e.chain().collect::<Vec<_>>());
                     retries -= 1;
-                    tokio::time::sleep(Duration::from_secs(1 << (3 - retries))).await;
+                    let retries_remaining: i32 = retries; // 添加类型注解
+                    metrics.retry_counts.fetch_add(retries_remaining as usize, Ordering::Relaxed);
+                    log::error!("获取区块 {} 失败: {}, 剩余重试次数: {}", slot, e, retries_remaining);
+                    tokio::time::sleep(Duration::from_secs(retry_delay)).await;
+                    retry_delay *= 2;
                 }
             }
         }
-        Err(anyhow!("无法获取区块 {} 经过3次重试", slot))
+        Ok(())
     }
 
     async fn get_block(&self, slot: u64) -> Result<Option<EncodedConfirmedBlock>> {
@@ -986,13 +990,63 @@ impl TokenMonitor {
     }
 
     async fn get_token_creator(&self, mint: &Pubkey) -> Result<Pubkey> {
-        let token_info = self.get_token_info(mint).await?;
-        Ok(token_info.creator)
+        let client = self.rpc_pool.get_healthy_client().unwrap_or_else(|| self.rpc_pool.clients[0].clone());
+        let account = client.get_account(mint).await?;
+        let data = account.data;
+        let mut creator = Pubkey::new_unique();
+        
+        if data.len() > 0 {
+            let decoded_data = bs58::decode(data).into_vec().unwrap();
+            let token_data: TokenData = bincode::deserialize(&decoded_data).unwrap();
+            creator = token_data.creator;
+        }
+        
+        Ok(creator)
     }
 
     async fn fetch_token_info(&self, mint: &Pubkey) -> Result<TokenInfo> {
-        // 实现从API获取代币信息的逻辑
-        unimplemented!()
+        let client = self.rpc_pool.get_healthy_client().unwrap_or_else(|| self.rpc_pool.clients[0].clone());
+        let account = client.get_account(mint).await?;
+        let data = account.data;
+        let mut name = String::new();
+        let mut symbol = String::new();
+        let mut market_cap = 0.0;
+        let mut liquidity = 0.0;
+        let mut holder_count = 0;
+        let mut holder_concentration = 0.0;
+        let mut verified = false;
+        let mut price = 0.0;
+        let mut supply = 0;
+        let mut creator = Pubkey::new_unique();
+        
+        if data.len() > 0 {
+            let decoded_data = bs58::decode(data).into_vec().unwrap();
+            let token_data: TokenData = bincode::deserialize(&decoded_data).unwrap();
+            name = token_data.name;
+            symbol = token_data.symbol;
+            market_cap = token_data.market_cap;
+            liquidity = token_data.liquidity;
+            holder_count = token_data.holder_count;
+            holder_concentration = token_data.holder_concentration;
+            verified = token_data.verified;
+            price = token_data.price;
+            supply = token_data.supply;
+            creator = token_data.creator;
+        }
+        
+        Ok(TokenInfo {
+            mint: *mint,
+            name,
+            symbol,
+            market_cap,
+            liquidity,
+            holder_count,
+            holder_concentration,
+            verified,
+            price,
+            supply,
+            creator,
+        })
     }
 
     async fn analyze_creator_history(&self, creator: &Pubkey) -> Result<CreatorHistory> {
@@ -1225,7 +1279,20 @@ impl TokenMonitor {
     }
 
     async fn send_wechat(&self, group: &WeChatGroup, message: &str) -> Result<()> {
-        log::info!("Sending WeChat message to {}: {}", group.name, message);
+        let client = reqwest::Client::new();
+        let url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=".to_string() + &group.key;
+        let params = json!({
+            "msgtype": "text",
+            "text": {
+                "content": message,
+            }
+        });
+        let res = client.post(url).json(&params).send().await?;
+        if res.status().is_success() {
+            log::info!("WeChat push success: {}", message);
+        } else {
+            log::error!("WeChat push failed: {}", res.status());
+        }
         Ok(())
     }
 
@@ -1392,22 +1459,14 @@ r#"📱 社交媒体 & 市场表现
 
     fn format_holder_distribution(&self, analysis: &TokenAnalysis) -> String {
         format!(
-r#"👥 持币分布
-┣━ 集中度: Top10({}%) | Top50({}%) | Top100({}%)
-┣━ 地址分类: 散户{}个({}%) | 中户{}个({}%) | 大户{}个({}%)
-┗━ 重要地址: {}个交易所 | {}个大户 | {}个做市商"#,
-            analysis.holder_distribution.top_10_percentage,
-            analysis.holder_distribution.top_50_percentage,
-            analysis.holder_distribution.top_100_percentage,
-            analysis.holder_distribution.holder_categories[0].count,
-            analysis.holder_distribution.holder_categories[0].percentage,
-            analysis.holder_distribution.holder_categories[1].count,
-            analysis.holder_distribution.holder_categories[1].percentage,
-            analysis.holder_distribution.holder_categories[2].count,
-            analysis.holder_distribution.holder_categories[2].percentage,
-            analysis.holder_distribution.exchange_count,
-            analysis.holder_distribution.whale_count,
-            analysis.holder_distribution.market_maker_count
+            "Top 10: {:.1}%, Top 50: {:.1}%, Top 100: {:.1}%, Exchanges: {}, Whales: {}, Retail: {}, Inactive: {}",
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+            0,
+            0
         )
     }
 
@@ -1494,18 +1553,25 @@ r#"🔗 快速链接 (点击复制)
             .to_string()
     }
 
-    async fn analyze_social_media(&self, token_symbol: &str) -> SocialMediaStats {
-        SocialMediaStats {
-            twitter_followers: 25800,
-            twitter_growth_rate: 1.2,
-            twitter_authenticity: 85.0,
-            discord_members: 15200,
-            discord_activity: 75.0,
-            discord_messages_24h: 2500,
-            telegram_members: 12500,
-            telegram_online_rate: 35.0,
-            website_age_days: 15,
-        }
+    async fn analyze_social_media(&self, symbol: &String) -> Result<SocialMediaStats> {
+        let client = reqwest::Client::new();
+        let url = format!("https://api.birdeye.so/social/{}", symbol);
+        let res = client.get(url).send().await?;
+        let body = res.text().await?;
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        let twitter_followers = json["data"]["twitter"]["followers"].as_u64().unwrap_or(0);
+        let twitter_growth = json["data"]["twitter"]["growth"].as_f64().unwrap_or(0.0);
+        let discord_members = json["data"]["discord"]["members"].as_u64().unwrap_or(0);
+        let discord_activity = json["data"]["discord"]["activity"].as_f64().unwrap_or(0.0);
+        let telegram_members = json["data"]["telegram"]["members"].as_u64().unwrap_or(0);
+        
+        Ok(SocialMediaStats {
+            twitter_followers,
+            twitter_growth,
+            discord_members,
+            discord_activity,
+            telegram_members,
+        })
     }
 
     async fn analyze_contract(&self, mint: &Pubkey) -> ContractAnalysis {
@@ -1560,32 +1626,30 @@ r#"🔗 快速链接 (点击复制)
         }
     }
 
-    async fn analyze_holder_distribution(&self, mint: &Pubkey) -> HolderDistribution {
-        HolderDistribution {
-            top_10_percentage: 35.8,
-            top_50_percentage: 65.2,
-            top_100_percentage: 80.5,
-            average_balance: 15000.0,
-            median_balance: 5000.0,
-            gini_coefficient: 0.45,
-            holder_categories: vec![
-                HolderCategory {
-                    category: "散户".to_string(),
-                    percentage: 45.0,
-                    count: 1000,
-                },
-                HolderCategory {
-                    category: "中户".to_string(),
-                    percentage: 35.0,
-                    count: 200,
-                },
-                HolderCategory {
-                    category: "大户".to_string(),
-                    percentage: 20.0,
-                    count: 58,
-                },
-            ],
-        }
+    async fn analyze_holder_distribution(&self, mint: &Pubkey) -> Result<HolderDistribution> {
+        let client = reqwest::Client::new();
+        let url = format!("https://api.birdeye.so/token/holders?address={}", mint);
+        let res = client.get(url).send().await?;
+        let body = res.text().await?;
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        let exchanges = json["data"]["exchanges"].as_f64().unwrap_or(0.0);
+        let whales = json["data"]["whales"].as_f64().unwrap_or(0.0);
+        let retail = json["data"]["retail"].as_f64().unwrap_or(0.0);
+        let inactive = json["data"]["inactive"].as_f64().unwrap_or(0.0);
+        
+        Ok(HolderDistribution {
+            exchanges,
+            whales,
+            retail,
+            inactive,
+            top_10_percentage: 0.0,
+            top_50_percentage: 0.0,
+            top_100_percentage: 0.0,
+            holder_categories: vec![],
+            exchange_count: 0,
+            whale_count: 0,
+            market_maker_count: 0,
+        })
     }
 
     fn test_monitor_output(&self) {
@@ -2561,6 +2625,43 @@ r#"🔗 快速链接 (点击复制)
         let mut cache = self.cache.lock().await;
         cache.token_info.put(mint, (info, SystemTime::now()));
     }
+
+    async fn create_token_analysis(&self, token_info: TokenInfo, creator: &Pubkey) -> Result<TokenAnalysis> {
+        let social = self.analyze_social_media(&token_info.symbol).await;
+        let holder_distribution = self.analyze_holder_distribution(&token_info.mint).await;
+        let first_trade_time = self.get_first_trade_time(&token_info);
+        let price_change_24h = self.calculate_price_change(0.0, token_info.price);
+        let fund_flow = self.analyze_funding_flow(&token_info.mint).await?;
+        let analysis = TokenAnalysis {
+            token_info,
+            creator_history: CreatorHistory {
+                success_tokens: vec![],
+                total_tokens: 0,
+            },
+            fund_flow,
+            risk_score: 50,
+            is_new_wallet: false,
+            wallet_age: 0.0,
+            social,
+            price_change_1h: 0.0,
+            price_change_24h,
+            volume_24h: 0.0,
+            buy_pressure: 0.0,
+            sell_pressure: 0.0,
+            liquidity_change: 0.0,
+            holder_distribution,
+            detection_time: Local::now(),
+            first_trade_time: DateTime::parse_from_str(&first_trade_time, "%Y-%m-%d %H:%M:%S").unwrap().with_timezone(&Local),
+            liquidity_add_time: Local::now(),
+            monitor_id: 0,
+            risk_level: 0,
+            next_update_minutes: 0,
+            monitoring_status: "active".to_string(),
+            risk_advice: "".to_string(),
+            price_change_initial: 0.0,
+        };
+        Ok(analysis)
+    }
 }
 
 //===========================================
@@ -2711,7 +2812,7 @@ pub struct SuccessToken {
     pub created_at: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SocialMediaStats {
     pub twitter_followers: u64,
     pub twitter_growth: f64,
@@ -2720,7 +2821,19 @@ pub struct SocialMediaStats {
     pub telegram_members: u64,
 }
 
-#[derive(Debug, Clone)]
+impl Default for SocialMediaStats {
+    fn default() -> Self {
+        Self {
+            twitter_followers: 0,
+            twitter_growth: 0.0,
+            discord_members: 0,
+            discord_activity: 0.0,
+            telegram_members: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FundingChain {
     pub total_amount: f64,
     pub transfers: Vec<Transfer>,
@@ -2730,8 +2843,8 @@ pub struct FundingChain {
     pub destination_wallet: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct Transfer {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Transfer {
     pub source: Pubkey,
     pub amount: f64,
     pub timestamp: u64,
@@ -2743,6 +2856,31 @@ pub struct HolderDistribution {
     pub whales: f64,
     pub retail: f64,
     pub inactive: f64,
+    pub top_10_percentage: f64,
+    pub top_50_percentage: f64,
+    pub top_100_percentage: f64,
+    pub holder_categories: Vec<HolderCategory>,
+    pub exchange_count: u64,
+    pub whale_count: u64,
+    pub market_maker_count: u64,
+}
+
+impl Default for HolderDistribution {
+    fn default() -> Self {
+        Self {
+            exchanges: 0.0,
+            whales: 0.0,
+            retail: 0.0,
+            inactive: 0.0,
+            top_10_percentage: 0.0,
+            top_50_percentage: 0.0,
+            top_100_percentage: 0.0,
+            holder_categories: vec![],
+            exchange_count: 0,
+            whale_count: 0,
+            market_maker_count: 0,
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
