@@ -12,7 +12,10 @@ use lru::LruCache;
 use dashmap::DashMap;
 use futures::future::join_all;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, AtomicF64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicF64, AtomicBool, Ordering, AtomicU64};
+use std::future::Future;
+use atomic_float::AtomicF64;
+use chrono::{DateTime, Local};
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
@@ -24,7 +27,7 @@ use solana_transaction_status::{
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::{Duration, SystemTime, Instant, UNIX_EPOCH},
+    time::{Duration, SystemTime, Instant, UNIX_EPOCH, DateTime, Local},
     io::Read,
     process,
     path::Path,
@@ -47,8 +50,8 @@ use log4rs::{
     encode::pattern::PatternEncoder,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Config {
+#[derive(Debug, Clone)]
+struct AppConfig {
     api_keys: Vec<String>,
     serverchan: ServerChanConfig,
     wcf: WeChatFerryConfig,
@@ -56,7 +59,7 @@ struct Config {
     rpc_nodes: HashMap<String, RpcNodeConfig>,
 }
 
-impl Config {
+impl AppConfig {
     fn builder() -> ConfigBuilder {
         ConfigBuilder::default()
     }
@@ -97,8 +100,8 @@ impl ConfigBuilder {
         self
     }
 
-    fn build(self) -> Result<Config> {
-        Ok(Config {
+    fn build(self) -> Result<AppConfig> {
+        Ok(AppConfig {
             api_keys: self.api_keys,
             serverchan: self.serverchan.unwrap_or_default(),
             wcf: self.wcf.unwrap_or_default(),
@@ -455,7 +458,7 @@ impl SmartBatcher {
 }
 
 struct TokenMonitor {
-    config: Config,
+    config: AppConfig,
     rpc_pool: Arc<RpcPool>,
     cache: Arc<Mutex<CacheSystem>>,
     logger: Arc<AsyncLogger>,
@@ -571,9 +574,8 @@ struct SuccessToken {
 
 #[derive(Debug, Clone)]
 struct FundingChain {
-    transfers: Vec<Transfer>,
     total_amount: f64,
-    risk_score: u8,
+    transfers: Vec<Transfer>,
 }
 
 #[derive(Debug, Clone)]
@@ -581,8 +583,7 @@ struct Transfer {
     source: Pubkey,
     amount: f64,
     timestamp: u64,
-    tx_id: String,
-    success_tokens: Option<Vec<SuccessToken>>,
+    success_tokens: Option<Vec<TokenInfo>>,
 }
 
 #[derive(Debug)]
@@ -648,18 +649,11 @@ impl ProxyPool {
         let mut working_proxies = Vec::new();
         
         for proxy in &self.proxies {
-            // 添加超时和重试机制
             let result = self.test_proxy(proxy).await;
             match result {
-                Ok(true) => {
-                    working_proxies.push(proxy.clone());
-                },
-                Ok(false) => {
-                    log::warn!("代理 {} 检测失败", proxy.id);
-                },
-                Err(e) => {
-                    log::error!("代理检测错误: {}", e);
-                }
+                Ok(true) => working_proxies.push(proxy.clone()),
+                Ok(false) => log::warn!("代理 {} 检测失败", proxy.id),
+                Err(e) => log::error!("代理检测错误: {}", e),
             }
         }
         
@@ -872,7 +866,7 @@ impl TokenMonitor {
         Ok(())
     }
 
-    fn load_config() -> Result<Config> {
+    fn load_config() -> Result<AppConfig> {
         let config_path = dirs::home_dir()
             .ok_or_else(|| anyhow!("Cannot find home directory"))?
             .join(".solana_pump")
@@ -917,10 +911,8 @@ impl TokenMonitor {
 
             let mut metrics = self.metrics.lock().await;
             metrics.processing_delays.push(start_time.elapsed());
-            metrics.retry_counts.fetch_add(
-                (3 - retries) as usize,  // 确保转换为usize
-                Ordering::Relaxed
-            );  // 错误方式
+            let retries_remaining = 3 - retries_used;
+            metrics.retry_counts.fetch_add(retries_remaining as usize, Ordering::Relaxed);
             
             time::sleep(Duration::from_millis(20)).await;
         }
@@ -1160,7 +1152,6 @@ impl TokenMonitor {
                     source,
                     amount: transfer.amount,
                     timestamp: transfer.timestamp,
-                    tx_id: transfer.signature,
                     success_tokens: if success_tokens.is_empty() {
                         None
                     } else {
@@ -1168,7 +1159,6 @@ impl TokenMonitor {
                     },
                 }],
                 total_amount: transfer.amount,
-                risk_score: 0,
             };
 
             let sub_chains = self.trace_fund_flow_recursive(&source, visited, depth + 1, max_depth).await?;
@@ -1207,7 +1197,6 @@ impl TokenMonitor {
                 source: tx.source,
                 amount: tx.amount,
                 timestamp: tx.timestamp,
-                tx_id: tx.signature,
                 success_tokens: None,
             })
             .collect())
@@ -1741,7 +1730,6 @@ r#"🔗 快速链接 (点击复制)
                             source: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".parse().unwrap(),
                             amount: 1250.5,
                             timestamp: 1711008000, // 2024-03-21 12:00:00
-                            tx_id: "5KtPn1LGuxhFqnXGKxgVPJ6eXrec8LD6ENxgfvzewZFwRBpfnyaQYKCYXgYjkKxVGvnkxhQp".to_string(),
                             success_tokens: Some(vec![
                                 SuccessToken {
                                     address: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".parse().unwrap(),
@@ -1754,7 +1742,6 @@ r#"🔗 快速链接 (点击复制)
                         }
                     ],
                     total_amount: 1250.5,
-                    risk_score: 25,
                 }
             ],
             risk_score: 35,
@@ -1857,7 +1844,8 @@ r#"🔗 快速链接 (点击复制)
         Ok(())
     }
 
-    pub struct ServiceState {
+    #[derive(Debug, Clone)]
+    struct ServiceState {
         running: Arc<AtomicBool>,
         last_error: Arc<Mutex<Option<String>>>,
         start_time: SystemTime,
@@ -2314,6 +2302,162 @@ r#"🔗 快速链接 (点击复制)
                 log::error!("心跳推送失败: {}", e);
             }
         }
+    }
+
+    pub fn generate_risk_alert(&self, analysis: &TokenAnalysis) -> String {
+        // 资金流格式化
+        let fund_flows = analysis.fund_flows.iter().enumerate().map(|(i, flow)| {
+            let arrow = "↑".repeat(3);
+            let flow_type = match flow.risk_level {
+                0..=30 => "✅ 低风险资金",
+                31..=70 => "⚠️ 中等风险",
+                _ => "🚨 高风险资金"
+            };
+            
+            format!(
+                "┣━ 资金链#{} ({:.2} SOL) - {}\n┃   {}\n┃   {} └ {}\n┃   {} └ {}",
+                i+1,
+                flow.amount,
+                flow_type,
+                flow.destination_wallet,
+                arrow,
+                flow.intermediate_wallet,
+                arrow,
+                flow.source_wallet
+            )
+        }).collect::<Vec<_>>().join("\n");
+
+        // 创建者历史格式化
+        let creator_history = analysis.creator_projects.iter().map(|p| {
+            format!(
+                "┃   ┣━ {}. {}: ${:.1}M ({})",
+                p.index, p.name, p.market_cap, p.date
+            )
+        }).collect::<Vec<_>>().join("\n");
+
+        // 持币分布格式化
+        let holder_distribution = analysis.holder_distribution.iter().map(|(category, percent)| {
+            format!("┣━ {}: {:.1}%", category, percent)
+        }).collect::<Vec<_>>().join("\n");
+
+        format!(
+            r#"🚨 高风险代币预警 - 需要特别关注!
+┏━━━━━━━━━━━━━━━━━━━━━ 🔔 深度分析报告 (UTC+8) ━━━━━━━━━━━━━━━━━━━━━┓
+
+📋 基础信息
+┣━ 代币: {} ({})
+┣━ 合约: {} 📋
+┗━ 创建者: {} 📋
+
+💰 代币数据
+┣━ 发行量: {} | 初始价格: ${} | 当前价格: ${}
+┣━ 当前市值: ${:.1}M | 流动性: {} SOL | 涨幅: +{:.1}%
+┗━ 锁定详情: {} | 持有人: {} | 集中度: {:.1}%
+
+💸 资金追溯 (总流入: {:.2} SOL)
+{}
+
+📊 创建者分析
+┣━ 历史数据: 项目总数: {}个 | 成功: {}个({:.1}%) | 高风险项目: {}个
+┣━ 代币列表:
+{}
+┗━ 综合指标: 平均市值: ${:.2}M | 信用评分: {}
+
+⚠️ 风险评估 (风险评分: {}/100)
+┣━ 高风险信号:
+┃   ┣━ {} 
+┃   ┗━ {}
+┣━ 中等风险:
+┃   ┣━ {}
+┃   ┗━ {}
+┗━ 积极因素:
+    ┣━ {}
+    ┗━ {}
+
+📱 社交媒体 & 市场表现
+┣━ 社交数据: Twitter({},+{:.1}%) | Discord({},{:.1}%活跃) | TG({})
+┣━ 价格变动: 1h(+{:.1}%) | 24h(+{:.1}%) | 首次交易(+{:.1}%)
+┗━ 交易数据: 24h量(${:.1}M) | 买压({:.1}%) | 卖压({:.1}%) | 流动性变化(+{:.1}%)
+
+👥 持币分布
+{}
+┗━ 重要地址: {}个交易所 | {}个大户 | {}个做市商
+
+🔗 快速链接 (点击复制)
+┣━ Birdeye: {}
+┣━ Solscan: {}
+┗━ 创建者: {}
+
+⏰ 监控信息
+┣━ 关键时间: 发现({}) | 首交易({}) | 流动性添加({})
+┣━ 监控编号: {} | 风险等级: {}
+┗━ 下次更新: {}分钟后 | 当前状态: {}
+
+💡 风险提示
+{}
+"#,
+            analysis.name,
+            analysis.symbol,
+            self.format_short_address(&analysis.mint),
+            self.format_short_address(&analysis.creator),
+            analysis.total_supply,
+            analysis.initial_price,
+            analysis.current_price,
+            analysis.market_cap / 1_000_000.0,
+            analysis.liquidity,
+            analysis.price_change_24h * 100.0,
+            analysis.lock_details,
+            analysis.holder_count,
+            analysis.holder_concentration * 100.0,
+            analysis.total_inflow,
+            fund_flows,
+            analysis.creator_project_count,
+            analysis.creator_success_count,
+            (analysis.creator_success_count as f64 / analysis.creator_project_count as f64) * 100.0,
+            analysis.creator_high_risk_count,
+            creator_history,
+            analysis.creator_avg_market_cap / 1_000_000.0,
+            analysis.creator_credit_rating,
+            analysis.risk_score,
+            analysis.high_risk_factors[0],
+            analysis.high_risk_factors[1],
+            analysis.medium_risk_factors[0],
+            analysis.medium_risk_factors[1],
+            analysis.positive_factors[0],
+            analysis.positive_factors[1],
+            analysis.social.twitter_followers,
+            analysis.social.twitter_growth * 100.0,
+            analysis.social.discord_members,
+            analysis.social.discord_activity * 100.0,
+            analysis.social.telegram_members,
+            analysis.price_change_1h * 100.0,
+            analysis.price_change_24h * 100.0,
+            analysis.initial_price_change * 100.0,
+            analysis.volume_24h / 1_000_000.0,
+            analysis.buy_pressure * 100.0,
+            analysis.sell_pressure * 100.0,
+            analysis.liquidity_change * 100.0,
+            holder_distribution,
+            analysis.exchange_wallets,
+            analysis.whale_wallets,
+            analysis.market_makers,
+            format!("birdeye.so/token/{}", analysis.mint),
+            format!("solscan.io/token/{}", analysis.mint),
+            format!("solscan.io/account/{}", analysis.creator),
+            analysis.detection_time.format("%m-%d %H:%M"),
+            analysis.first_trade_time.format("%m-%d %H:%M"),
+            analysis.liquidity_add_time.format("%m-%d %H:%M"),
+            analysis.monitor_id,
+            analysis.risk_level,
+            analysis.next_update_minutes,
+            analysis.monitoring_status,
+            analysis.risk_advice
+        )
+    }
+
+    fn format_short_address(&self, address: &Pubkey) -> String {
+        let addr_str = address.to_string();
+        format!("{}...{}", &addr_str[..4], &addr_str[addr_str.len()-4..])
     }
 }
 
