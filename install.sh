@@ -122,4 +122,4 @@ echo "安装完成！"
 echo "开始运行监控程序..."
 
 # 运行脚本
-./monitor.sh
+./solana_pump_monitor2.sh
