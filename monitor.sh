@@ -10,8 +10,8 @@ CONFIG_FILE="$HOME/.solana_pump.cfg"
 LOG_FILE="$HOME/pump_monitor.log"
 RPC_FILE="$HOME/.solana_pump.rpc"
 PIDFILE="/tmp/solana_pump_monitor.pid"
-RUST_BIN="$HOME/.solana_pump/monitor"
-RUST_SRC="monitor.rs"
+PROJECT_DIR="$HOME/.solana_pump"
+CARGO_BIN="$PROJECT_DIR/target/release/solana-monitor"
 
 # 颜色定义
 RED='\033[31m'
@@ -631,17 +631,38 @@ manage_rpc() {
 #===========================================
 # 环境管理模块
 #===========================================
-# 检查环境状态
 check_env() {
     echo -e "${YELLOW}>>> 检查环境...${RESET}"
     
-    # 检查必要工具
-    local tools=("jq" "bc" "curl")
+    # 检查系统依赖
+    local deps=(
+        "build-essential"
+        "pkg-config"
+        "libssl-dev"
+        "libudev-dev"
+        "jq"
+        "bc"
+        "curl"
+        "git"
+    )
+    
     local missing=()
     
-    for tool in "${tools[@]}"; do
-        if ! command -v $tool &>/dev/null; then
-            missing+=($tool)
+    # 检查包管理器
+    if command -v apt &>/dev/null; then
+        PKG_MGR="apt"
+        sudo apt update
+    elif command -v yum &>/dev/null; then
+        PKG_MGR="yum"
+    else
+        echo -e "${RED}✗ 不支持的系统!${RESET}"
+        exit 1
+    fi
+    
+    # 检查并安装缺失的依赖
+    for dep in "${deps[@]}"; do
+        if ! dpkg -l | grep -q "^ii  $dep"; then
+            missing+=($dep)
         fi
     done
     
@@ -652,18 +673,70 @@ check_env() {
     fi
     
     if [ ${#missing[@]} -ne 0 ]; then
-        echo -e "${RED}缺少以下工具: ${missing[*]}${RESET}"
-        echo -e "${YELLOW}>>> 准备安装缺失的工具...${RESET}"
-        
-        if command -v apt &>/dev/null; then
-            sudo apt update
-            sudo apt install -y "${missing[@]}"
-        elif command -v yum &>/dev/null; then
-            sudo yum install -y "${missing[@]}"
-        else
-            echo -e "${RED}✗ 不支持的系统!${RESET}"
-            exit 1
-        fi
+        echo -e "${RED}缺少以下依赖: ${missing[*]}${RESET}"
+        echo -e "${YELLOW}>>> 准备安装缺失的依赖...${RESET}"
+        sudo $PKG_MGR install -y "${missing[@]}"
+    fi
+    
+    # 创建必要的目录结构
+    echo -e "${YELLOW}>>> 创建必要目录...${RESET}"
+    mkdir -p "$PROJECT_DIR/logs"
+    mkdir -p "$HOME/.solana/pump/logs"
+    
+    # 创建默认配置文件
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}>>> 创建默认配置文件...${RESET}"
+        cat > "$CONFIG_FILE" << EOF
+{
+    "api_keys": [],
+    "serverchan": {
+        "keys": []
+    },
+    "wcf": {
+        "groups": []
+    },
+    "proxy": {
+        "enabled": false,
+        "ip": "",
+        "port": 0,
+        "username": "",
+        "password": ""
+    },
+    "rpc_nodes": {}
+}
+EOF
+        chmod 600 "$CONFIG_FILE"
+    fi
+    
+    # 配置环境变量
+    if ! grep -q "SSL_CERT_FILE" ~/.bashrc; then
+        echo -e "${YELLOW}>>> 配置环境变量...${RESET}"
+        echo 'export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt' >> ~/.bashrc
+        source ~/.bashrc
+    fi
+    
+    # 创建 systemd 服务
+    if [ ! -f "/etc/systemd/system/solana-monitor.service" ]; then
+        echo -e "${YELLOW}>>> 创建系统服务...${RESET}"
+        sudo tee /etc/systemd/system/solana-monitor.service << EOF
+[Unit]
+Description=Solana Token Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+WorkingDirectory=$PROJECT_DIR
+ExecStart=$CARGO_BIN
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable solana-monitor
     fi
     
     echo -e "${GREEN}✓ 环境检查完成${RESET}"
@@ -675,6 +748,7 @@ install_rust() {
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
     source "$HOME/.cargo/env"
     rustup default stable
+    rustup update
     echo -e "${GREEN}✓ Rust环境安装完成${RESET}"
 }
 
@@ -713,14 +787,18 @@ test_rpc() {
 # 编译Rust程序
 build_monitor() {
     echo -e "${YELLOW}>>> 编译监控程序...${RESET}"
-    if [ ! -f "$RUST_SRC" ]; then
-        echo -e "${RED}✗ 未找到monitor.rs源文件${RESET}"
+    if [ ! -f "Cargo.toml" ]; then
+        echo -e "${RED}✗ 未找到Cargo.toml${RESET}"
         return 1
     fi
     
-    rustc "$RUST_SRC" -o "$RUST_BIN"
+    cargo build --release
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}✓ 编译成功${RESET}"
+        # 确保目标目录存在
+        mkdir -p "$PROJECT_DIR/target/release"
+        # 复制编译好的二进制文件
+        cp target/release/solana-monitor "$CARGO_BIN"
         return 0
     else
         echo -e "${RED}✗ 编译失败${RESET}"
@@ -739,13 +817,13 @@ start_monitor() {
         rm -f "$PIDFILE"
     fi
     
-    if [ ! -f "$RUST_BIN" ]; then
+    if [ ! -f "$CARGO_BIN" ]; then
         echo -e "${YELLOW}>>> 监控程序未编译，准备编译...${RESET}"
         build_monitor || return 1
     fi
     
     echo -e "${YELLOW}>>> 启动监控程序...${RESET}"
-    nohup "$RUST_BIN" > "$LOG_FILE" 2>&1 &
+    nohup "$CARGO_BIN" > "$LOG_FILE" 2>&1 &
     echo $! > "$PIDFILE"
     echo -e "${GREEN}✓ 监控程序已启动 (PID: $!)${RESET}"
 }
