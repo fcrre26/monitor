@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicUsize, AtomicF64, AtomicBool, Ordering, AtomicU64}
 use std::future::Future;
 use atomic_float::AtomicF64;
 use chrono::{DateTime, Local};
-
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use solana_transaction_status::{
@@ -49,6 +48,7 @@ use log4rs::{
     config::{Appender, Config, Root},
     encode::pattern::PatternEncoder,
 };
+use log4rs::append::console::ConsoleAppender;
 
 #[derive(Debug, Clone)]
 struct AppConfig {
@@ -358,6 +358,7 @@ struct MonitorState {
     alerts: Vec<Alert>,
     watch_addresses: HashSet<String>,
     metrics: MonitorMetrics,
+    start_time: SystemTime,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -500,28 +501,22 @@ impl Clone for TokenMonitor {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct MonitorState {
-    last_slot: u64,
-    processed_mints: HashSet<String>,
-    start_time: SystemTime,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FundingChain {
+    total_amount: f64,
+    transfers: Vec<Transfer>,
+    risk_level: u8,
+    source_wallet: String,
+    intermediate_wallet: String,
+    destination_wallet: String,
 }
 
-impl Default for MonitorState {
-    fn default() -> Self {
-        Self {
-            last_slot: 0,
-            processed_mints: HashSet::new(),
-            start_time: SystemTime::now(),
-        }
-    }
-}
-
-#[derive(Default)]
-struct Cache {
-    token_info: HashMap<Pubkey, (TokenInfo, SystemTime)>,
-    creator_history: HashMap<Pubkey, (CreatorHistory, SystemTime)>,
-    fund_flow: HashMap<Pubkey, (Vec<FundingChain>, SystemTime)>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Transfer {
+    source: Pubkey,
+    amount: f64,
+    timestamp: u64,
+    success_tokens: Option<Vec<TokenInfo>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,63 +532,6 @@ struct TokenInfo {
     price: f64,
     supply: u64,
     creator: Pubkey,
-}
-
-impl From<TokenResponse> for TokenInfo {
-    fn from(response: TokenResponse) -> Self {
-        TokenInfo {
-            mint: response.data.mint,
-            name: response.data.name,
-            symbol: response.data.symbol,
-            market_cap: response.data.market_cap,
-            liquidity: response.data.liquidity,
-            holder_count: response.data.holder_count,
-            holder_concentration: response.data.holder_concentration,
-            verified: response.data.verified,
-            price: response.data.price,
-            supply: response.data.supply,
-            creator: response.data.creator,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CreatorHistory {
-    success_tokens: Vec<SuccessToken>,
-    total_tokens: u64,
-}
-
-#[derive(Debug, Clone)]
-struct SuccessToken {
-    address: Pubkey,
-    symbol: String,
-    name: String,
-    market_cap: f64,
-    created_at: u64,
-}
-
-#[derive(Debug, Clone)]
-struct FundingChain {
-    total_amount: f64,
-    transfers: Vec<Transfer>,
-}
-
-#[derive(Debug, Clone)]
-struct Transfer {
-    source: Pubkey,
-    amount: f64,
-    timestamp: u64,
-    success_tokens: Option<Vec<TokenInfo>>,
-}
-
-#[derive(Debug)]
-struct TokenAnalysis {
-    token_info: TokenInfo,
-    creator_history: CreatorHistory,
-    fund_flow: Vec<FundingChain>,
-    risk_score: u8,
-    is_new_wallet: bool,
-    wallet_age: f64,
 }
 
 #[derive(Debug, Default)]
@@ -690,8 +628,8 @@ impl ProxyPool {
 }
 
 impl TokenMonitor {
-    const PARALLEL_REQUESTS: usize = 20;
     const BLOCK_BATCH_SIZE: usize = 100;
+    const MAX_PENDING_REQUESTS: usize = 1000;
     const WORKER_THREADS: usize = 20;
 
     fn get_proxy(config: &ProxyConfig) -> Option<reqwest::Proxy> {
@@ -1044,6 +982,22 @@ impl TokenMonitor {
             risk_score,
             is_new_wallet: wallet_age < 1.0,
             wallet_age,
+            social: self.analyze_social_media(&token_info.symbol).await,
+            price_change_1h: self.calculate_price_change(token_info.price, token_info.price),
+            price_change_24h: self.calculate_price_change(token_info.price, token_info.price),
+            volume_24h: 0.0,
+            buy_pressure: 0.0,
+            sell_pressure: 0.0,
+            liquidity_change: 0.0,
+            holder_distribution: self.analyze_holder_distribution(mint).await,
+            detection_time: chrono::Local::now(),
+            first_trade_time: chrono::Local::now(),
+            liquidity_add_time: chrono::Local::now(),
+            monitor_id: "".to_string(),
+            risk_level: "".to_string(),
+            next_update_minutes: 0,
+            monitoring_status: "".to_string(),
+            risk_advice: "".to_string(),
         })
     }
 
@@ -1159,6 +1113,10 @@ impl TokenMonitor {
                     },
                 }],
                 total_amount: transfer.amount,
+                risk_level: 0,
+                source_wallet: "".to_string(),
+                intermediate_wallet: "".to_string(),
+                destination_wallet: "".to_string(),
             };
 
             let sub_chains = self.trace_fund_flow_recursive(&source, visited, depth + 1, max_depth).await?;
@@ -1477,18 +1435,18 @@ r#"📱 社交媒体 & 市场表现
 ┣━ 社交数据: Twitter({:,},{}%) | Discord({:,},{}%活跃) | TG({:,})
 ┣━ 价格变动: 1h({}%) | 24h({}%) | 首次交易({}%)
 ┗━ 交易数据: 24h量({}) | 买压({}%) | 卖压({}%) | 流动性变化({}%)"#,
-            analysis.social_stats.twitter_followers,
-            format_change(analysis.social_stats.twitter_growth_rate),
-            analysis.social_stats.discord_members,
-            analysis.social_stats.discord_activity,
-            analysis.social_stats.telegram_members,
-            format_change(analysis.price_stats.change_1h),
-            format_change(analysis.price_stats.change_24h),
-            format_change(analysis.price_stats.change_initial),
-            format_volume(analysis.trading_stats.volume_24h),
-            analysis.trading_stats.buy_pressure,
-            analysis.trading_stats.sell_pressure,
-            format_change(analysis.trading_stats.liquidity_change)
+            analysis.social.twitter_followers,
+            format_change(analysis.social.twitter_growth),
+            analysis.social.discord_members,
+            analysis.social.discord_activity,
+            analysis.social.telegram_members,
+            format_change(analysis.price_change_1h),
+            format_change(analysis.price_change_24h),
+            format_change(analysis.price_change_initial),
+            format_volume(analysis.volume_24h),
+            analysis.buy_pressure,
+            analysis.sell_pressure,
+            format_change(analysis.liquidity_change)
         )
     }
 
@@ -1747,6 +1705,22 @@ r#"🔗 快速链接 (点击复制)
             risk_score: 35,
             is_new_wallet: false,
             wallet_age: 245.5,
+            social: self.analyze_social_media(&"PEPE2".to_string()).await,
+            price_change_1h: 0.0,
+            price_change_24h: 0.0,
+            volume_24h: 0.0,
+            buy_pressure: 0.0,
+            sell_pressure: 0.0,
+            liquidity_change: 0.0,
+            holder_distribution: self.analyze_holder_distribution(mint).await,
+            detection_time: chrono::Local::now(),
+            first_trade_time: chrono::Local::now(),
+            liquidity_add_time: chrono::Local::now(),
+            monitor_id: "".to_string(),
+            risk_level: "".to_string(),
+            next_update_minutes: 0,
+            monitoring_status: "".to_string(),
+            risk_advice: "".to_string(),
         };
 
         let output = format!(
@@ -1844,8 +1818,9 @@ r#"🔗 快速链接 (点击复制)
         Ok(())
     }
 
+    // 在 TokenMonitor 结构体定义之前
     #[derive(Debug, Clone)]
-    struct ServiceState {
+    pub struct ServiceState {
         running: Arc<AtomicBool>,
         last_error: Arc<Mutex<Option<String>>>,
         start_time: SystemTime,
@@ -2027,13 +2002,17 @@ r#"🔗 快速链接 (点击复制)
             }
             
             let mut chain = FundingChain {
-                total_amount: activity.amount,
                 transfers: vec![Transfer {
                     source: activity.source,
                     amount: activity.amount,
                     timestamp: activity.timestamp,
                     success_tokens: None,
                 }],
+                total_amount: activity.amount,
+                risk_level: 0,
+                source_wallet: "".to_string(),
+                intermediate_wallet: "".to_string(),
+                destination_wallet: "".to_string(),
             };
             
             // 递归追踪资金流向
@@ -2475,36 +2454,6 @@ struct TokenMetrics {
     verified: bool,
 }
 
-#[derive(Debug)]
-struct FundingChain {
-    total_amount: f64,
-    transfers: Vec<Transfer>,
-}
-
-#[derive(Debug)]
-struct Transfer {
-    source: Pubkey,
-    amount: f64,
-    timestamp: u64,
-    success_tokens: Option<Vec<TokenInfo>>,
-}
-
-#[derive(Debug)]
-struct TokenInfo {
-    symbol: String,
-    market_cap: f64,
-}
-
-// 添加健康检查结构
-#[derive(Debug)]
-pub struct ServiceHealth {
-    running: bool,
-    uptime: u64,
-    processed_blocks: usize,
-    processed_tokens: usize,
-    last_error: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     data: TokenData,
@@ -2561,6 +2510,38 @@ struct TokenListItem {
     name: String,
     market_cap: f64,
     created_at: u64,
+}
+
+#[derive(Debug)]
+pub struct LoadMetrics {
+    pub cpu_usage: AtomicF64,
+    pub memory_usage: AtomicF64,
+}
+
+impl Default for LoadMetrics {
+    fn default() -> Self {
+        Self {
+            cpu_usage: AtomicF64::new(0.0),
+            memory_usage: AtomicF64::new(0.0),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RpcMetrics {
+    pub requests: AtomicUsize,
+    pub errors: AtomicUsize,
+    pub latency: AtomicF64,
+}
+
+impl Default for RpcMetrics {
+    fn default() -> Self {
+        Self {
+            requests: AtomicUsize::new(0),
+            errors: AtomicUsize::new(0),
+            latency: AtomicF64::new(0.0),
+        }
+    }
 }
 
 #[cfg(test)]
