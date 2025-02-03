@@ -33,14 +33,16 @@ wget https://raw.githubusercontent.com/fcrre26/monitor/refs/heads/main/monitor.r
 wget https://raw.githubusercontent.com/fcrre26/monitor/refs/heads/main/Cargo.toml -O $WORK_DIR/Cargo.toml
 wget https://raw.githubusercontent.com/fcrre26/monitor/refs/heads/main/solana_pump_monitor2.sh -O $WORK_DIR/solana_pump_monitor2.sh
 
+# 移动源文件到src目录
+mv $WORK_DIR/monitor.rs $WORK_DIR/src/main.rs
+
 # 设置权限
 chmod +x $WORK_DIR/solana_pump_monitor2.sh
-chmod +x $INSTALL_DIR/bin/solana-monitor
-chmod 600 $INSTALL_DIR/config/config.json
-chown -R $USER:$USER $INSTALL_DIR
 
 # 创建配置
-echo '{"addresses":[]}' > $INSTALL_DIR/config/watch_addresses.json
+cat > $INSTALL_DIR/config/watch_addresses.json << EOF
+{"addresses":[]}
+EOF
 
 # 配置DNS
 echo "配置DNS..."
@@ -109,6 +111,10 @@ echo "配置DNS..."
 echo "nameserver 8.8.8.8" >> /etc/resolv.conf
 echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 
+# 设置权限
+chmod +x $INSTALL_DIR/bin/solana-monitor
+chmod 600 $INSTALL_DIR/config/config.json
+chown -R $USER:$USER $INSTALL_DIR
 
 echo "安装完成！"
 echo -e "\n使用说明:"
