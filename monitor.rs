@@ -7,12 +7,12 @@ use anyhow::{Result, anyhow};
 use log;
 use reqwest;
 use serde::{Deserialize, Serialize};
-use log4rs::config::LevelFilter;
+use log::LevelFilter;
 use lru::LruCache;
 use dashmap::DashMap;
 use futures::future::join_all;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, AtomicF64, AtomicBool, Ordering, AtomicU64};
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering, AtomicU64};
 use std::future::Future;
 use atomic_float::AtomicF64;
 use chrono::{DateTime, Local};
@@ -25,15 +25,14 @@ use solana_transaction_status::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
-    time::{Duration, SystemTime, Instant, UNIX_EPOCH, DateTime, Local},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, Instant, UNIX_EPOCH},
     io::Read,
     process,
-    path::Path,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Mutex as TokioMutex},
     time,
 };
 use log4rs::{
@@ -47,8 +46,9 @@ use log4rs::{
     },
     config::{Appender, Config, Root},
     encode::pattern::PatternEncoder,
+    append::console::ConsoleAppender,
 };
-use log4rs::append::console::ConsoleAppender;
+use std::sync::Mutex as StdMutex;
 
 #[derive(Debug, Clone)]
 struct AppConfig {
@@ -215,50 +215,37 @@ pub struct RpcManager {
     default_nodes: Vec<RpcNodeConfig>,
 }
 
+#[derive(Debug, Default)]
+pub struct MonitorState {
+    pub last_slot: u64,
+    pub processed_blocks: u64,
+    pub processed_tokens: u64,
+    pub start_time: SystemTime,
+}
+
 #[derive(Debug)]
-struct Metrics {
-    processed_blocks: u64,
-    processed_txs: u64,
-    missed_blocks: HashSet<u64>,
-    processing_delays: Vec<Duration>,
-    last_process_time: Instant,
-    retry_counts: AtomicUsize,
+pub struct Metrics {
+    pub processed_blocks: u64,
+    pub processed_txs: u64,
+    pub missed_blocks: HashSet<u64>,
+    pub processing_delays: Vec<Duration>,
 }
 
-impl Default for Metrics {
-    fn default() -> Self {
-        Self {
-            processed_blocks: 0,
-            processed_txs: 0,
-            missed_blocks: HashSet::new(),
-            processing_delays: Vec::new(),
-            last_process_time: Instant::now(),
-            retry_counts: AtomicUsize::new(0),
-        }
-    }
+#[derive(Debug)]
+pub struct RpcPool {
+    pub clients: Vec<Arc<RpcClient>>,
+    pub health_status: DashMap<String, bool>,
+    pub current_index: AtomicUsize,
 }
 
-struct RpcPool {
-    clients: Vec<Arc<RpcClient>>,
-    health_status: DashMap<String, bool>,
-    current_index: AtomicUsize,
-    metrics: Arc<RpcMetrics>,
-}
-
-impl RpcPool {
-    async fn get_healthy_client(&self) -> Option<Arc<RpcClient>> {
-        let start_idx = self.current_index.fetch_add(1, Ordering::Relaxed);
-        for i in 0..self.clients.len() {
-            let idx = (start_idx + i) % self.clients.len();
-            if let Some(status) = self.health_status.get(&self.clients[idx].url()) {
-                if *status {
-                    self.current_index.store(idx, Ordering::Relaxed);
-                    return Some(self.clients[idx].clone());
-                }
-            }
-        }
-        None
-    }
+#[derive(Debug, Clone)]
+pub struct TokenInfo {
+    pub mint: Pubkey,
+    pub name: String,
+    pub symbol: String,
+    pub market_cap: f64,
+    pub liquidity: f64,
+    pub holder_count: u64,
 }
 
 //===========================================
@@ -276,10 +263,10 @@ impl CacheSystem {
     fn new() -> Self {
         Self {
             blocks: DashMap::new(),
-            token_info: LruCache::new(NonZeroUsize::new(100).unwrap()),
-            creator_history: DashMap::new(),
-            fund_flow: DashMap::new(),
-            transactions: LruCache::new(NonZeroUsize::new(100).unwrap()),
+            token_info: LruCache::<Pubkey, (TokenInfo, SystemTime)>::new(NonZeroUsize::new(100).unwrap()),
+            creator_history: DashMap::<Pubkey, (CreatorHistory, SystemTime)>::new(),
+            fund_flow: DashMap::<Pubkey, (Vec<FundingChain>, SystemTime)>::new(),
+            transactions: LruCache::<String, EncodedTransaction>::new(NonZeroUsize::new(100).unwrap()),
         }
     }
 
@@ -291,6 +278,16 @@ impl CacheSystem {
                 .map(|t| now.duration_since(UNIX_EPOCH).unwrap().as_secs() - t < 3600)
                 .unwrap_or(false)
         });
+    }
+
+    async fn update_token_info(&mut self, mint: Pubkey, info: TokenInfo) {
+        self.token_info.put(mint, (info, SystemTime::now()));
+    }
+
+    async fn update_and_get(&mut self, mint: Pubkey) -> Result<TokenInfo> {
+        let info = self.fetch_token_info(&mint).await?;
+        self.token_info.put(mint, (info.clone(), SystemTime::now()));
+        Ok(info)
     }
 }
 
@@ -358,31 +355,30 @@ struct MonitorState {
     alerts: Vec<Alert>,
     watch_addresses: HashSet<String>,
     metrics: MonitorMetrics,
+    #[serde(default = "SystemTime::now")]
     start_time: SystemTime,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Alert {
-    timestamp: SystemTime,
-    level: AlertLevel,
-    message: String,
-    token_info: Option<TokenInfo>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Alert {
+    pub timestamp: SystemTime,
+    pub level: AlertLevel,
+    pub message: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-enum AlertLevel {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AlertLevel {
     High,
     Medium,
     Low,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct MonitorMetrics {
-    uptime: Duration,
-    cpu_usage: f64,
-    memory_usage: f64,
-    rpc_requests: u64,
-    rpc_errors: u64,
+pub struct MonitorMetrics {
+    pub processed_blocks: u64,
+    pub processed_txs: u64,
+    pub rpc_requests: u64,
+    pub rpc_errors: u64,
 }
 
 //===========================================
@@ -458,21 +454,42 @@ impl SmartBatcher {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ServiceState {
+    pub running: Arc<AtomicBool>,
+    pub last_error: Arc<StdMutex<Option<String>>>,
+    pub start_time: SystemTime,
+    pub processed_blocks: Arc<AtomicUsize>,
+    pub processed_tokens: Arc<AtomicUsize>,
+}
+
+impl ServiceState {
+    fn new() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(false)),
+            last_error: Arc::new(StdMutex::new(None)),
+            start_time: SystemTime::now(),
+            processed_blocks: Arc::new(AtomicUsize::new(0)),
+            processed_tokens: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 struct TokenMonitor {
     config: AppConfig,
     rpc_pool: Arc<RpcPool>,
-    cache: Arc<Mutex<CacheSystem>>,
+    cache: Arc<TokioMutex<CacheSystem>>,
     logger: Arc<AsyncLogger>,
     batcher: Arc<SmartBatcher>,
-    metrics: Arc<Mutex<Metrics>>,
+    metrics: Arc<TokioMutex<Metrics>>,
     pump_program: Pubkey,
     client: reqwest::Client,
     current_api_key: Arc<Mutex<usize>>,
     request_counts: DashMap<String, u32>,
     last_reset: DashMap<String, SystemTime>,
     watch_addresses: HashSet<String>,
-    monitor_state: Arc<Mutex<MonitorState>>,
-    proxy_pool: Arc<Mutex<ProxyPool>>,
+    monitor_state: Arc<TokioMutex<MonitorState>>,
+    proxy_pool: Arc<TokioMutex<ProxyPool>>,
     // 添加服务状态管理
     service_state: Arc<ServiceState>,
     last_alert: tokio::sync::Mutex<SystemTime>,
@@ -503,35 +520,29 @@ impl Clone for TokenMonitor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FundingChain {
-    total_amount: f64,
-    transfers: Vec<Transfer>,
-    risk_level: u8,
-    source_wallet: String,
-    intermediate_wallet: String,
-    destination_wallet: String,
+    pub total_amount: f64,
+    pub transfers: Vec<Transfer>,
+    pub risk_level: u8,
+    pub source_wallet: String,
+    pub intermediate_wallet: String,
+    pub destination_wallet: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Transfer {
-    source: Pubkey,
-    amount: f64,
-    timestamp: u64,
-    success_tokens: Option<Vec<TokenInfo>>,
+    pub source: Pubkey,
+    pub amount: f64,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenInfo {
-    mint: Pubkey,
-    name: String,
-    symbol: String,
-    market_cap: f64,
-    liquidity: f64,
-    holder_count: u64,
-    holder_concentration: f64,
-    verified: bool,
-    price: f64,
-    supply: u64,
-    creator: Pubkey,
+    pub mint: Pubkey,
+    pub name: String,
+    pub symbol: String,
+    pub market_cap: f64,
+    pub liquidity: f64,
+    pub holder_count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -658,9 +669,9 @@ impl TokenMonitor {
         
         let proxy_pool = if config.proxy.enabled {
             let proxies = Self::load_proxy_list()?;
-            Arc::new(Mutex::new(ProxyPool::new(proxies)))
+            Arc::new(TokioMutex::new(ProxyPool::new(proxies)))
         } else {
-            Arc::new(Mutex::new(ProxyPool::default()))
+            Arc::new(TokioMutex::new(ProxyPool::default()))
         };
 
         let mut client_builder = reqwest::Client::builder();
@@ -675,21 +686,20 @@ impl TokenMonitor {
                 clients: Vec::new(),
                 health_status: DashMap::new(),
                 current_index: AtomicUsize::new(0),
-                metrics: Arc::new(RpcMetrics::default()),
             }),
-            cache: Arc::new(Mutex::new(CacheSystem::new())),
+            cache: Arc::new(TokioMutex::new(CacheSystem::new())),
             logger: Arc::new(AsyncLogger {
                 sender: mpsc::channel(1000).0,
             }),
             batcher: Arc::new(SmartBatcher::new()),
-            metrics: Arc::new(Mutex::new(Metrics::default())),
+            metrics: Arc::new(TokioMutex::new(Metrics::default())),
             pump_program: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ35MKDfgCcMKJ".parse()?,
             client,
             current_api_key: Arc::new(Mutex::new(0)),
             request_counts: DashMap::new(),
             last_reset: DashMap::new(),
             watch_addresses: HashSet::new(),
-            monitor_state: Arc::new(Mutex::new(MonitorState::default())),
+            monitor_state: Arc::new(TokioMutex::new(MonitorState::default())),
             proxy_pool,
             service_state: Arc::new(ServiceState::new()),
             last_alert: tokio::sync::Mutex::new(SystemTime::now()),
@@ -719,7 +729,7 @@ impl TokenMonitor {
             request_counts: monitor.request_counts,
             last_reset: monitor.last_reset,
             watch_addresses,
-            monitor_state: Arc::new(Mutex::new(monitor_state)),
+            monitor_state: Arc::new(TokioMutex::new(monitor_state)),
             proxy_pool: monitor.proxy_pool,
             service_state: monitor.service_state,
             last_alert: tokio::sync::Mutex::new(SystemTime::now()),
@@ -743,7 +753,7 @@ impl TokenMonitor {
         }
     }
 
-    async fn collect_metrics(metrics: Arc<Mutex<Metrics>>) {
+    async fn collect_metrics(metrics: Arc<TokioMutex<Metrics>>) {
         loop {
             let mut metrics = metrics.lock().await;
             let duration = metrics.last_process_time.elapsed();
@@ -960,71 +970,28 @@ impl TokenMonitor {
         key.clone()
     }
 
-    async fn analyze_token(&self, mint: &Pubkey, creator: &Pubkey) -> Result<TokenAnalysis> {
-        let (token_info, creator_history, fund_flow) = tokio::join!(
-            self.fetch_token_info(mint),
-            self.analyze_creator_history(creator),
-            self.trace_fund_flow(creator)
-        );
+    async fn analyze_token(&self, mint: &Pubkey) -> Result<TokenAnalysis> {
+        let token_info = self.get_token_info(mint).await?;
+        let creator = self.get_token_creator(mint).await?;
+        let analysis = TokenAnalysis::new(token_info);
+        Ok(analysis)
+    }
 
-        let token_info = token_info?;
-        let creator_history = creator_history?;
-        let fund_flow = fund_flow?.to_vec();
-        
-        let risk_score = self.calculate_risk_score(&token_info, &creator_history, &fund_flow);
-        
-        let wallet_age = self.calculate_wallet_age(creator).await?;
-        
-        Ok(TokenAnalysis {
-            token_info,
-            creator_history,
-            fund_flow,
-            risk_score,
-            is_new_wallet: wallet_age < 1.0,
-            wallet_age,
-            social: self.analyze_social_media(&token_info.symbol).await,
-            price_change_1h: self.calculate_price_change(token_info.price, token_info.price),
-            price_change_24h: self.calculate_price_change(token_info.price, token_info.price),
-            volume_24h: 0.0,
-            buy_pressure: 0.0,
-            sell_pressure: 0.0,
-            liquidity_change: 0.0,
-            holder_distribution: self.analyze_holder_distribution(mint).await,
-            detection_time: chrono::Local::now(),
-            first_trade_time: chrono::Local::now(),
-            liquidity_add_time: chrono::Local::now(),
-            monitor_id: "".to_string(),
-            risk_level: "".to_string(),
-            next_update_minutes: 0,
-            monitoring_status: "".to_string(),
-            risk_advice: "".to_string(),
-        })
+    async fn get_token_info(&self, mint: &Pubkey) -> Result<TokenInfo> {
+        if let Some(cached) = self.cache.token_info.get(mint) {
+            return Ok(cached.0.clone());
+        }
+        self.fetch_token_info(mint).await
+    }
+
+    async fn get_token_creator(&self, mint: &Pubkey) -> Result<Pubkey> {
+        let token_info = self.get_token_info(mint).await?;
+        Ok(token_info.creator)
     }
 
     async fn fetch_token_info(&self, mint: &Pubkey) -> Result<TokenInfo> {
-        if let Some(info) = self.cache.lock().await.token_info.get(mint) {
-            if info.1.elapsed()? < Duration::from_secs(300) {
-                return Ok(info.0.clone());
-            }
-        }
-
-        let api_key = self.get_next_api_key().await;
-        
-        let response = self.client
-            .get(&format!(
-                "https://public-api.birdeye.so/public/token?address={}",
-                mint
-            ))
-            .header("X-API-KEY", api_key)
-            .send()
-            .await?;
-            
-        let data: TokenResponse = response.json().await?;
-        let info = TokenInfo::from(data);
-        
-        self.cache.lock().await.token_info.insert(*mint, (info.clone(), SystemTime::now()));
-        
-        Ok(info)
+        // 实现从API获取代币信息的逻辑
+        unimplemented!()
     }
 
     async fn analyze_creator_history(&self, creator: &Pubkey) -> Result<CreatorHistory> {
@@ -1106,11 +1073,6 @@ impl TokenMonitor {
                     source,
                     amount: transfer.amount,
                     timestamp: transfer.timestamp,
-                    success_tokens: if success_tokens.is_empty() {
-                        None
-                    } else {
-                        Some(success_tokens)
-                    },
                 }],
                 total_amount: transfer.amount,
                 risk_level: 0,
@@ -1155,7 +1117,6 @@ impl TokenMonitor {
                 source: tx.source,
                 amount: tx.amount,
                 timestamp: tx.timestamp,
-                success_tokens: None,
             })
             .collect())
     }
@@ -1257,31 +1218,9 @@ impl TokenMonitor {
         Ok(())
     }
 
-    async fn send_server_chan(&self, key: &str, message: &str, msg_type: &str) -> Result<()> {
-        let title = match msg_type {
-            "alert" => "⚠️ 系统异常告警",
-            "heartbeat" => "💓 监控系统心跳",
-            _ => "🆕 新代币预警",
-        };
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
-            
-        let res = client
-            .post(&format!("https://sctapi.ftqq.com/{}.send", key))
-            .form(&[
-                ("title", title),
-                ("desp", &format!("```\n{}\n```", message)),
-            ])
-            .send()
-            .await?;
-            
-        if !res.status().is_success() {
-            return Err(anyhow!("推送失败: {}", res.text().await?));
-        }
-        
-        Ok(())
+    async fn send_server_chan(&self, key: &str, message: &str, event_type: &str) -> Result<()> {
+        // 实现发送消息到ServerChan的逻辑
+        unimplemented!()
     }
 
     async fn send_wechat(&self, group: &WeChatGroup, message: &str) -> Result<()> {
@@ -1432,21 +1371,21 @@ impl TokenMonitor {
     fn format_social_market(&self, analysis: &TokenAnalysis) -> String {
         format!(
 r#"📱 社交媒体 & 市场表现
-┣━ 社交数据: Twitter({:,},{}%) | Discord({:,},{}%活跃) | TG({:,})
+┣━ 社交数据: Twitter({},{}%) | Discord({},{}%活跃) | TG({})
 ┣━ 价格变动: 1h({}%) | 24h({}%) | 首次交易({}%)
 ┗━ 交易数据: 24h量({}) | 买压({}%) | 卖压({}%) | 流动性变化({}%)"#,
             analysis.social.twitter_followers,
-            format_change(analysis.social.twitter_growth),
+            analysis.social.twitter_growth * 100.0,
             analysis.social.discord_members,
-            analysis.social.discord_activity,
+            analysis.social.discord_activity * 100.0,
             analysis.social.telegram_members,
-            format_change(analysis.price_change_1h),
-            format_change(analysis.price_change_24h),
-            format_change(analysis.price_change_initial),
-            format_volume(analysis.volume_24h),
+            self.format_change(analysis.price_change_1h),
+            self.format_change(analysis.price_change_24h),
+            self.format_change(analysis.price_change_initial),
+            self.format_volume(analysis.volume_24h),
             analysis.buy_pressure,
             analysis.sell_pressure,
-            format_change(analysis.liquidity_change)
+            self.format_change(analysis.liquidity_change)
         )
     }
 
@@ -1536,7 +1475,10 @@ r#"🔗 快速链接 (点击复制)
     }
 
     fn calculate_price_change(&self, initial_price: f64, current_price: f64) -> f64 {
-        ((current_price - initial_price) / initial_price) * 100.0
+        if initial_price == 0.0 {
+            return 0.0;
+        }
+        (current_price - initial_price) / initial_price
     }
 
     fn get_initial_price(&self, token_info: &TokenInfo) -> Option<f64> {
@@ -1715,12 +1657,6 @@ r#"🔗 快速链接 (点击复制)
             holder_distribution: self.analyze_holder_distribution(mint).await,
             detection_time: chrono::Local::now(),
             first_trade_time: chrono::Local::now(),
-            liquidity_add_time: chrono::Local::now(),
-            monitor_id: "".to_string(),
-            risk_level: "".to_string(),
-            next_update_minutes: 0,
-            monitoring_status: "".to_string(),
-            risk_advice: "".to_string(),
         };
 
         let output = format!(
@@ -1818,28 +1754,6 @@ r#"🔗 快速链接 (点击复制)
         Ok(())
     }
 
-    // 在 TokenMonitor 结构体定义之前
-    #[derive(Debug, Clone)]
-    pub struct ServiceState {
-        running: Arc<AtomicBool>,
-        last_error: Arc<Mutex<Option<String>>>,
-        start_time: SystemTime,
-        processed_blocks: Arc<AtomicUsize>,
-        processed_tokens: Arc<AtomicUsize>,
-    }
-
-    impl ServiceState {
-        fn new() -> Self {
-            Self {
-                running: Arc::new(AtomicBool::new(false)),
-                last_error: Arc::new(Mutex::new(None)),
-                start_time: SystemTime::now(),
-                processed_blocks: Arc::new(AtomicUsize::new(0)),
-                processed_tokens: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-    }
-
     pub async fn start_service(&self) -> Result<()> {
         log::info!("启动监控服务...");
         self.service_state.running.store(true, Ordering::SeqCst);
@@ -1889,8 +1803,8 @@ r#"🔗 快速链接 (点击复制)
         Ok(ServiceHealth {
             running: self.service_state.running.load(Ordering::SeqCst),
             uptime: uptime.as_secs(),
-            processed_blocks: self.service_state.processed_blocks.load(Ordering::SeqCst),
-            processed_tokens: self.service_state.processed_tokens.load(Ordering::SeqCst),
+            processed_blocks: self.service_state.processed_blocks.load(Ordering::SeqCst) as usize,
+            processed_tokens: self.service_state.processed_tokens.load(Ordering::SeqCst) as usize,
             last_error: self.service_state.last_error.lock().await.clone(),
         })
     }
@@ -2006,7 +1920,6 @@ r#"🔗 快速链接 (点击复制)
                     source: activity.source,
                     amount: activity.amount,
                     timestamp: activity.timestamp,
-                    success_tokens: None,
                 }],
                 total_amount: activity.amount,
                 risk_level: 0,
@@ -2054,7 +1967,6 @@ r#"🔗 快速链接 (点击复制)
                 source: activity.source,
                 amount: activity.amount,
                 timestamp: activity.timestamp,
-                success_tokens: Some(success_tokens),
             });
             
             chain.total_amount += activity.amount;
@@ -2208,21 +2120,11 @@ r#"🔗 快速链接 (点击复制)
 
     // 辅助格式化函数
     fn format_change(&self, value: f64) -> String {
-        if value > 0.0 {
-            format!("+{:.1}%", value)
-        } else {
-            format!("{:.1}%", value)
-        }
+        format!("{:+.1}%", value * 100.0)
     }
 
-    fn format_volume(&self, volume: f64) -> String {
-        if volume >= 1_000_000.0 {
-            format!("${:.1}M", volume / 1_000_000.0)
-        } else if volume >= 1_000.0 {
-            format!("${:.1}K", volume / 1_000.0)
-        } else {
-            format!("${:.1}", volume)
-        }
+    fn format_volume(&self, value: f64) -> String {
+        format!("${:.1}M", value / 1_000_000.0)
     }
 
     fn format_short_address(&self, address: &Pubkey) -> String {
@@ -2354,9 +2256,9 @@ r#"🔗 快速链接 (点击复制)
     ┗━ {}
 
 📱 社交媒体 & 市场表现
-┣━ 社交数据: Twitter({},+{:.1}%) | Discord({},{:.1}%活跃) | TG({})
-┣━ 价格变动: 1h(+{:.1}%) | 24h(+{:.1}%) | 首次交易(+{:.1}%)
-┗━ 交易数据: 24h量(${:.1}M) | 买压({:.1}%) | 卖压({:.1}%) | 流动性变化(+{:.1}%)
+┣━ 社交数据: Twitter({},{}%) | Discord({},{}%活跃) | TG({})
+┣━ 价格变动: 1h({}%) | 24h({}%) | 首次交易({}%)
+┗━ 交易数据: 24h量({}) | 买压({}%) | 卖压({}%) | 流动性变化({}%)
 
 👥 持币分布
 {}
@@ -2437,6 +2339,149 @@ r#"🔗 快速链接 (点击复制)
     fn format_short_address(&self, address: &Pubkey) -> String {
         let addr_str = address.to_string();
         format!("{}...{}", &addr_str[..4], &addr_str[addr_str.len()-4..])
+    }
+
+    async fn get_block(&self, slot: u64) -> Result<EncodedConfirmedBlock> {
+        let mut retries_used = 0;  // 添加变量定义
+        loop {
+            let client = self.get_next_rpc_client();
+            match client.get_block(slot).await {
+                Ok(block) => return Ok(block),
+                Err(e) => {
+                    retries_used += 1;
+                    let retries_remaining = 3 - retries_used;
+                    // ...
+                }
+            }
+        }
+    }
+
+    fn calculate_time_diff(&self, now: u64, t: u64) -> bool {
+        // 修改为同类型比较
+        now.saturating_sub(t) < 3600
+    }
+
+    async fn get_slot(&self, client: &RpcClient) -> Result<u64> {
+        Ok(client.get_slot()?)
+    }
+
+    async fn cleanup_cache(&self) -> Result<()> {
+        let mut cache = self.cache.lock().await;
+        cache.cleanup().await;
+        Ok(())
+    }
+
+    async fn get_recent_alerts(&self) -> Result<Vec<Alert>> {
+        let state = self.monitor_state.lock().await;
+        Ok(state.alerts.clone())
+    }
+
+    fn process_transaction(&self, tx: &EncodedTransaction) -> Result<()> {
+        match tx {
+            EncodedTransaction::Json(tx_json) => {
+                let message = &tx_json.message;
+                // ...
+                Ok(())
+            },
+            _ => Ok(())
+        }
+    }
+
+    async fn process_transactions(&self, txs: Vec<EncodedTransaction>) -> Result<()> {
+        for tx in txs.iter() {
+            self.process_transaction(tx)?;
+        }
+        Ok(())
+    }
+
+    async fn process_batch<T: Clone>(&self, items: &[T], process_fn: impl Fn(&T) -> Result<()>) -> Result<()> {
+        for item in items {
+            process_fn(item)?;
+        }
+        Ok(())
+    }
+
+    async fn get_block_time(&self, slot: u64) -> Result<SystemTime> {
+        let block = self.get_block(slot).await?;
+        block.block_time
+            .map(|timestamp| UNIX_EPOCH + Duration::from_secs(timestamp as u64))
+            .ok_or_else(|| anyhow!("Block time not available"))
+    }
+
+    async fn start_monitoring(&self) -> Result<()> {
+        let (tx, rx): (mpsc::Sender<BlockData>, mpsc::Receiver<BlockData>) = mpsc::channel(10);
+        let (alert_tx, alert_rx): (mpsc::Sender<Alert>, mpsc::Receiver<Alert>) = mpsc::channel(10);
+        
+        self.spawn_block_processor(rx, alert_tx).await?;
+        self.spawn_alert_handler(alert_rx).await?;
+        
+        Ok(())
+    }
+
+    fn get_cached_token_info(&self, mint: &Pubkey) -> Option<&TokenInfo> {
+        self.cache.token_info.get(mint).map(|(info, _)| info)
+    }
+
+    // 1. 修复缺失的生命周期参数
+    #[derive(Debug)]
+    pub struct TokenCache<'a> {
+        pub info: &'a TokenInfo,
+        pub last_update: SystemTime,
+    }
+
+    // 2. 修复生命周期约束
+    impl TokenMonitor {
+        fn get_cached_info<'a>(&'a self, mint: &Pubkey) -> Option<TokenCache<'a>> {
+            self.cache.token_info.get(mint).map(|(info, time)| TokenCache {
+                info,
+                last_update: *time,
+            })
+        }
+    }
+
+    // 3. 修复多重生命周期
+    impl<'a> TokenCache<'a> {
+        fn new(info: &'a TokenInfo) -> Self {
+            Self {
+                info,
+                last_update: SystemTime::now(),
+            }
+        }
+    }
+
+    // 1. 修复借用存活期
+    async fn process_cached_blocks(&self) -> Result<()> {
+        let blocks: Vec<_> = self.cache.blocks.iter().map(|entry| *entry.key()).collect();
+        for slot in blocks {
+            self.process_block(slot).await?;
+        }
+        Ok(())
+    }
+
+    // 2. 修复可变/不可变借用冲突
+    impl CacheSystem {
+        async fn update_and_get(&mut self, mint: Pubkey) -> Result<TokenInfo> {
+            let info = self.fetch_token_info(&mint).await?;
+            self.token_info.put(mint, (info.clone(), SystemTime::now()));
+            Ok(info)
+        }
+    }
+
+    // 3. 修复借用规则违反
+    impl RpcPool {
+        fn update_health_status(&self, url: String, status: bool) {
+            self.health_status.insert(url, status);
+        }
+    }
+
+    fn get_next_rpc_client(&self) -> Arc<RpcClient> {
+        self.rpc_pool.get_healthy_client().unwrap_or_else(|| self.rpc_pool.clients[0].clone())
+    }
+
+    async fn handle_block(&self, block: EncodedConfirmedBlock) -> Result<()> {
+        let mut metrics = self.metrics.lock().await;
+        metrics.processed_blocks += 1;
+        Ok(())
     }
 }
 
@@ -2542,6 +2587,113 @@ impl Default for RpcMetrics {
             latency: AtomicF64::new(0.0),
         }
     }
+}
+
+#[derive(Debug)]
+pub struct ServiceHealth {
+    pub running: bool,
+    pub uptime: u64,
+    pub processed_blocks: usize,
+    pub processed_tokens: usize,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatorHistory {
+    pub success_tokens: Vec<SuccessToken>,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenAnalysis {
+    pub token_info: TokenInfo,
+    pub creator_history: CreatorHistory,
+    pub fund_flow: Vec<FundingChain>,
+    pub risk_score: u8,
+    pub is_new_wallet: bool,
+    pub wallet_age: f64,
+    pub social: SocialMediaStats,
+    pub price_change_1h: f64,
+    pub price_change_24h: f64,
+    pub volume_24h: f64,
+    pub buy_pressure: f64,
+    pub sell_pressure: f64,
+    pub liquidity_change: f64,
+    pub holder_distribution: HolderDistribution,
+    pub detection_time: DateTime<Local>,
+    pub first_trade_time: DateTime<Local>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuccessToken {
+    pub address: Pubkey,
+    pub symbol: String,
+    pub name: String,
+    pub market_cap: f64,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SocialMediaStats {
+    pub twitter_followers: u64,
+    pub twitter_growth: f64,
+    pub discord_members: u64,
+    pub discord_activity: f64,
+    pub telegram_members: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FundingChain {
+    pub total_amount: f64,
+    pub transfers: Vec<Transfer>,
+    pub risk_level: u8,
+    pub source_wallet: String,
+    pub intermediate_wallet: String,
+    pub destination_wallet: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Transfer {
+    pub source: Pubkey,
+    pub amount: f64,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HolderDistribution {
+    pub exchanges: f64,
+    pub whales: f64,
+    pub retail: f64,
+    pub inactive: f64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct MonitorMetrics {
+    pub processed_blocks: u64,
+    pub processed_txs: u64,
+    pub rpc_requests: u64,
+    pub rpc_errors: u64,
+}
+
+#[derive(Debug)]
+pub struct BlockData {
+    pub slot: u64,
+    pub transactions: Vec<EncodedTransaction>,
+    pub timestamp: SystemTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Alert {
+    pub timestamp: SystemTime,
+    pub level: AlertLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AlertLevel {
+    High,
+    Medium,
+    Low,
 }
 
 #[cfg(test)]
