@@ -24,7 +24,7 @@ use solana_transaction_status::{
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::{Duration, SystemTime, Instant},
+    time::{Duration, SystemTime, Instant, UNIX_EPOCH},
     io::Read,
     process,
     path::Path,
@@ -238,11 +238,14 @@ struct RpcPool {
 
 impl RpcPool {
     async fn get_healthy_client(&self) -> Option<Arc<RpcClient>> {
-        let start_idx = self.current_index.load(Ordering::Relaxed);
+        let start_idx = self.current_index.fetch_add(1, Ordering::Relaxed);
         for i in 0..self.clients.len() {
             let idx = (start_idx + i) % self.clients.len();
-            if self.health_status.get(&self.clients[idx].url()).map_or(true, |v| *v) {
-                return Some(self.clients[idx].clone());
+            if let Some(status) = self.health_status.get(&self.clients[idx].url()) {
+                if *status {
+                    self.current_index.store(idx, Ordering::Relaxed);
+                    return Some(self.clients[idx].clone());
+                }
             }
         }
         None
@@ -274,26 +277,10 @@ impl CacheSystem {
     async fn cleanup(&mut self) {
         let now = SystemTime::now();
         
-        // 清理过期区块缓存
         self.blocks.retain(|_, v| {
             v.block_time
                 .map(|t| now.duration_since(UNIX_EPOCH).unwrap().as_secs() - t < 3600)
                 .unwrap_or(false)
-        });
-
-        // 清理过期代币信息
-        self.token_info.retain(|_, (_, time)| {
-            time.elapsed().unwrap() < Duration::from_secs(3600)
-        });
-
-        // 清理过期创建者历史
-        self.creator_history.retain(|_, (_, time)| {
-            time.elapsed().unwrap() < Duration::from_secs(3600 * 24)
-        });
-
-        // 清理过期资金流向
-        self.fund_flow.retain(|_, (_, time)| {
-            time.elapsed().unwrap() < Duration::from_secs(3600 * 12)
         });
     }
 }
@@ -617,20 +604,22 @@ impl ProxyPool {
     }
 
     async fn get_next_proxy(&mut self) -> Option<reqwest::Proxy> {
-        if self.proxies.is_empty() {
-            return None;
-        }
-
         let proxy = &self.proxies[self.current_index];
-        self.current_index = (self.current_index + 1) % self.proxies.len();
-
-        Some(reqwest::Proxy::http(&format!(
-            "http://{}:{}@{}:{}",
+        let protocol_str = proxy.protocol.as_str();
+        
+        let proxy_url = format!(
+            "{}://{}:{}@{}:{}",
+            protocol_str,
             proxy.username,
             proxy.password,
             proxy.ip,
             proxy.port
-        )).unwrap())
+        );
+
+        match proxy.protocol {
+            ProxyProtocol::Socks5 => reqwest::Proxy::all(&proxy_url).ok(),
+            _ => reqwest::Proxy::http(&proxy_url).ok(),
+        }
     }
 
     async fn check_proxies(&mut self) {
@@ -907,35 +896,31 @@ impl TokenMonitor {
         Err(anyhow!("All RPC clients failed"))
     }
 
-    async fn process_block(
-        &self,
-        slot: u64,
-        token_tx: &mpsc::Sender<(Pubkey, Pubkey)>,
-    ) -> Result<()> {
-        let block = match self.get_block(slot).await {
-            Ok(Some(block)) => block,
-            Ok(None) => {
-                let mut metrics = self.metrics.lock().await;
-                metrics.missed_blocks.insert(slot);
-                return Ok(());
-            }
-            Err(e) => {
-                log::error!("Failed to get block {}: {}", slot, e);
-                return Err(e.into());
-            }
-        };
+    async fn process_block(&self, slot: u64, token_tx: &mpsc::Sender<(Pubkey, Pubkey)>) -> Result<()> {
+        let mut retries = 3;
+        while retries > 0 {
+            match self.get_block(slot).await {
+                Ok(Some(block)) => {
+                    for tx in block.transactions {
+                        if let Some((mint, creator)) = self.extract_pump_info(&tx) {
+                            token_tx.send((mint, creator)).await?;
+                            let mut metrics = self.metrics.lock().await;
+                            metrics.processed_txs += 1;
+                        }
+                    }
 
-        for tx in block.transactions {
-            if let Some((mint, creator)) = self.extract_pump_info(&tx) {
-                token_tx.send((mint, creator)).await?;
-                let mut metrics = self.metrics.lock().await;
-                metrics.processed_txs += 1;
+                    let mut metrics = self.metrics.lock().await;
+                    metrics.processed_blocks += 1;
+                    return Ok(());
+                },
+                Err(e) => {
+                    log::warn!("获取区块 {} 失败 (剩余重试次数: {}): {}", slot, retries-1, e);
+                    retries -= 1;
+                    tokio::time::sleep(Duration::from_secs(1 << (3 - retries))).await;
+                }
             }
         }
-
-        let mut metrics = self.metrics.lock().await;
-        metrics.processed_blocks += 1;
-        Ok(())
+        Err(anyhow!("无法获取区块 {} 经过3次重试", slot))
     }
 
     async fn get_block(&self, slot: u64) -> Result<Option<EncodedConfirmedBlock>> {
@@ -1275,7 +1260,11 @@ impl TokenMonitor {
     }
 
     async fn send_server_chan(&self, key: &str, message: &str, analysis: &TokenAnalysis) -> Result<()> {
-        let res = self.client
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+            
+        let res = client
             .post(&format!("https://sctapi.ftqq.com/{}.send", key))
             .form(&[
                 ("title", "Solana新代币提醒"),
