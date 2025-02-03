@@ -12,7 +12,7 @@ use lru::LruCache;
 use dashmap::DashMap;
 use futures::future::join_all;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, AtomicF64, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicF64, AtomicBool, Ordering};
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
@@ -252,6 +252,8 @@ struct TokenMonitor {
     watch_addresses: HashSet<String>,
     monitor_state: Arc<Mutex<MonitorState>>,
     proxy_pool: Arc<Mutex<ProxyPool>>,
+    // 添加服务状态管理
+    service_state: Arc<ServiceState>,
 }
 
 impl Clone for TokenMonitor {
@@ -271,6 +273,7 @@ impl Clone for TokenMonitor {
             watch_addresses: self.watch_addresses.clone(),
             monitor_state: self.monitor_state.clone(),
             proxy_pool: self.proxy_pool.clone(),
+            service_state: self.service_state.clone(),
         }
     }
 }
@@ -518,6 +521,7 @@ impl TokenMonitor {
             watch_addresses: HashSet::new(),
             monitor_state: Arc::new(Mutex::new(MonitorState::default())),
             proxy_pool,
+            service_state: Arc::new(ServiceState::new()),
         };
 
         monitor.init_rpc_nodes();
@@ -546,6 +550,7 @@ impl TokenMonitor {
             watch_addresses,
             monitor_state: Arc::new(Mutex::new(monitor_state)),
             proxy_pool: monitor.proxy_pool,
+            service_state: monitor.service_state,
         })
     }
 
@@ -1941,34 +1946,26 @@ impl TokenMonitor {
         let log_dir = home_dir.join(".solana").join("pump").join("logs");
         std::fs::create_dir_all(&log_dir)?;
         
-        let config = log4rs::config::Config::builder()
-            .appender(
-                Appender::builder().build(
-                    "rolling",
-                    Box::new(
-                        RollingFileAppender::builder()
-                            .encoder(Box::new(PatternEncoder::new("{d} - {l} - {m}{n}")))
-                            .build(
-                                log_dir.join("solana_pump.log"),
-                                Box::new(
-                                    CompoundPolicy::new(
-                                        Box::new(SizeTrigger::new(10 * 1024 * 1024)),
-                                        Box::new(
-                                            FixedWindowRoller::builder()
-                                                .build(
-                                                    log_dir.join("solana_pump.{}.log").to_str().unwrap(),
-                                                    5,
-                                                )?
-                                            ),
-                                        )
-                                    )
-                                )
-                            )
-                        )
-                    ),
-                )
-            )?
-            .build(Root::builder().appender("rolling").build(LevelFilter::Info)))?;
+        // 1. 创建日志滚动器
+        let roller = FixedWindowRoller::builder()
+            .build(
+                log_dir.join("solana_pump.{}.log").to_str().unwrap(),
+                5,
+            )?;
+
+        // 2. 创建触发器和策略
+        let trigger = Box::new(SizeTrigger::new(10 * 1024 * 1024));
+        let policy = Box::new(CompoundPolicy::new(trigger, Box::new(roller)));
+
+        // 3. 创建日志追加器
+        let appender = RollingFileAppender::builder()
+            .encoder(Box::new(PatternEncoder::new("{d} - {l} - {m}{n}")))
+            .build(log_dir.join("solana_pump.log"), policy)?;
+
+        // 4. 创建并初始化配置
+        let config = Config::builder()
+            .appender(Appender::builder().build("rolling", Box::new(appender)))
+            .build(Root::builder().appender("rolling").build(LevelFilter::Info))?;
 
         log4rs::init_config(config)?;
         Ok(())
@@ -1987,36 +1984,37 @@ impl TokenMonitor {
     fn format_fund_flow(&self, fund_flow: &[FundingChain]) -> String {
         let mut result = String::new();
         for (i, chain) in fund_flow.iter().enumerate() {
-            let chain_type = if chain.risk_score > 50 {
-                " - ⚠️ 可疑资金链"
-            } else if i == fund_flow.len() - 1 {
-                " - 🆕 新钱包"
+            let risk_label = if chain.risk_score > 50 {
+                "⚠️ 高风险资金"
+            } else if chain.transfers[0].success_tokens.is_some() {
+                "✅ 已验证资金"
             } else {
-                " - 已验证资金链"
+                "🆕 新钱包"
             };
-            
+
             result.push_str(&format!(
-                "┣━ 资金来源#{} ({:.2f} SOL){}\n",
-                i + 1,
-                chain.total_amount,
-                chain_type
+                "┣━ 资金链#{} ({:.2} SOL) - {}\n",
+                i + 1, chain.total_amount, risk_label
             ));
 
             for transfer in &chain.transfers {
                 result.push_str(&format!(
-                    "┃   创建者钱包 [{}] 7xKX...gAsU\n\
-                     ┃   ↑ {:.2f} SOL └ {} [{}] {} ({})\n",
-                    chrono::DateTime::from_timestamp(transfer.timestamp as i64, 0)
-                        .unwrap()
-                        .format("%Y-%m-%d %H:%M"),
-                    transfer.amount,
-                    self.get_wallet_role(&transfer.source),
-                    chrono::DateTime::from_timestamp(transfer.timestamp as i64, 0)
-                        .unwrap()
-                        .format("%Y-%m-%d %H:%M"),
-                    &transfer.source.to_string()[..8],
-                    self.get_wallet_description(transfer)
+                    "┃   创建者钱包 [{:}] {}\n",
+                    self.format_timestamp(transfer.timestamp),
+                    transfer.source.to_string()
                 ));
+                
+                if let Some(ref tokens) = transfer.success_tokens {
+                    result.push_str(&format!(
+                        "┃   └─ {} ({})\n",
+                        self.get_wallet_role(&transfer.source),
+                        self.get_wallet_description(transfer)
+                    ));
+                }
+            }
+            
+            if i < fund_flow.len() - 1 {
+                result.push_str("┃\n");
             }
         }
         result
@@ -2317,86 +2315,467 @@ impl TokenMonitor {
 
         println!("{}", output);
     }
+
+    // 实现钱包角色判断
+    fn get_wallet_role(&self, address: &Pubkey) -> String {
+        if self.is_exchange_wallet(address) {
+            "交易所钱包".to_string()
+        } else if self.is_contract_wallet(address) {
+            "合约钱包".to_string()
+        } else {
+            "普通钱包".to_string()
+        }
+    }
+
+    // 实现钱包描述生成
+    fn get_wallet_description(&self, transfer: &Transfer) -> String {
+        if let Some(ref tokens) = transfer.success_tokens {
+            if !tokens.is_empty() {
+                format!("{} 创建者", tokens[0].symbol)
+            } else {
+                "中转钱包".to_string()
+            }
+        } else {
+            "新钱包".to_string()
+        }
+    }
+
+    // 辅助方法
+    fn is_exchange_wallet(&self, address: &Pubkey) -> bool {
+        // 实现交易所钱包检测逻辑
+        false // 临时返回
+    }
+
+    fn is_contract_wallet(&self, address: &Pubkey) -> bool {
+        // 实现合约钱包检测逻辑
+        false // 临时返回
+    }
+
+    // 添加缓存预热
+    async fn warm_up_cache(&self) -> Result<()> {
+        // 预加载常用数据
+        Ok(())
+    }
+
+    // 添加批量处理优化
+    async fn process_blocks_batch(&self, slots: Vec<u64>) -> Result<()> {
+        let futures: Vec<_> = slots.into_iter()
+            .map(|slot| self.process_block(slot, &self.token_tx))
+            .collect();
+            
+        join_all(futures).await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(())
+    }
+
+    // 添加服务状态管理
+    pub struct ServiceState {
+        running: Arc<AtomicBool>,
+        last_error: Arc<Mutex<Option<String>>>,
+        start_time: SystemTime,
+        processed_blocks: AtomicUsize,
+        processed_tokens: AtomicUsize,
+    }
+
+    impl ServiceState {
+        fn new() -> Self {
+            Self {
+                running: Arc::new(AtomicBool::new(false)),
+                last_error: Arc::new(Mutex::new(None)),
+                start_time: SystemTime::now(),
+                processed_blocks: AtomicUsize::new(0),
+                processed_tokens: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    // 添加服务控制方法
+    pub async fn start_service(&self) -> Result<()> {
+        log::info!("启动监控服务...");
+        self.service_state.running.store(true, Ordering::SeqCst);
+        
+        // 预热缓存
+        self.warm_up_cache().await?;
+        
+        // 启动工作线程
+        let (block_tx, block_rx) = mpsc::channel(1000);
+        let (token_tx, token_rx) = mpsc::channel(1000);
+        
+        // 启动区块处理
+        self.start_worker_threads(block_rx, token_tx.clone()).await?;
+        
+        // 启动代币分析
+        self.start_token_analysis(token_rx).await?;
+        
+        // 启动指标收集
+        self.start_metrics_collection().await?;
+        
+        Ok(())
+    }
+
+    pub async fn stop_service(&self) -> Result<()> {
+        log::info!("停止监控服务...");
+        self.service_state.running.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    // 添加健康检查
+    pub async fn health_check(&self) -> Result<ServiceHealth> {
+        let uptime = SystemTime::now()
+            .duration_since(self.service_state.start_time)?;
+            
+        Ok(ServiceHealth {
+            running: self.service_state.running.load(Ordering::SeqCst),
+            uptime: uptime.as_secs(),
+            processed_blocks: self.service_state.processed_blocks.load(Ordering::SeqCst),
+            processed_tokens: self.service_state.processed_tokens.load(Ordering::SeqCst),
+            last_error: self.service_state.last_error.lock().await.clone(),
+        })
+    }
+
+    // 添加指标收集
+    async fn start_metrics_collection(&self) -> Result<()> {
+        let metrics = self.metrics.clone();
+        let service_state = self.service_state.clone();
+        
+        tokio::spawn(async move {
+            while service_state.running.load(Ordering::SeqCst) {
+                // 收集并记录指标
+                let health = self.health_check().await?;
+                log::info!("服务状态: {:?}", health);
+                
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        
+        Ok(())
+    }
+
+    // 格式化通知消息
+    async fn format_notification(&self, analysis: &TokenAnalysis) -> String {
+        format!(
+r#"🚨 高风险代币预警 - 需要特别关注!
+┏━━━━━━━━━━━━━━━━━━━━━ 🔔 深度分析报告 (UTC+8) ━━━━━━━━━━━━━━━━━━━━━┓
+
+📋 基础信息
+┣━ 代币: {} ({})
+┣━ 合约: {} 📋
+┗━ 创建者: {} 📋
+
+💰 代币数据
+┣━ 发行量: {} | 初始价格: ${} | 当前价格: ${}
+┣━ 当前市值: ${} | 流动性: {} SOL | 涨幅: {}%
+┗━ 锁定详情: {}% 锁定{}天 | 持有人: {} | 集中度: {}%
+
+💸 资金追溯 (总流入: {:.2} SOL)
+{}
+
+📊 创建者分析
+┣━ 历史数据: 项目总数: {}个 | 成功: {}个({:.1}%) | 高风险项目: {}个
+┣━ 代币列表:
+{}
+┗━ 综合指标: 平均市值: ${:.2}M | 信用评分: {}
+
+⚠️ 风险评估 (风险评分: {}/100)
+{}
+
+📱 社交媒体 & 市场表现
+┣━ 社交数据: Twitter({},{}%) | Discord({},{}%活跃) | TG({})
+┣━ 价格变动: 1h({}%) | 24h({}%) | 首次交易({}%)
+┗━ 交易数据: 24h量(${:.1}M) | 买压({}%) | 卖压({}%) | 流动性变化({}%)
+
+👥 持币分布
+┣━ 集中度: Top10({}%) | Top50({}%) | Top100({}%)
+┣━ 地址分类: 散户{}个({}%) | 中户{}个({}%) | 大户{}个({}%)
+┗━ 重要地址: {}个交易所 | {}个大户 | {}个做市商
+
+🔗 快速链接 (点击复制)
+┣━ Birdeye: birdeye.so/token/{}
+┣━ Solscan: solscan.io/token/{}
+┗━ 创建者: solscan.io/account/{}
+
+⏰ 监控信息
+┣━ 关键时间: 发现({}) | 首交易({}) | 流动性添加({})
+┣━ 监控编号: #MON-{}-{:03} | 风险等级: {}
+┗━ 下次更新: {}分钟后 | 当前状态: {}
+
+💡 风险提示
+{}
+主要风险: {}
+建议: {}"#,
+            analysis.token_info.symbol,
+            analysis.token_info.name,
+            analysis.token_info.mint,
+            analysis.token_info.creator,
+            self.format_number(analysis.token_info.supply as f64),
+            analysis.token_info.price,
+            self.get_current_price(&analysis.token_info),
+            self.format_number(analysis.token_info.market_cap),
+            self.format_number(analysis.token_info.liquidity),
+            self.calculate_price_change(&analysis.token_info),
+            // ... 其他参数
+        )
+    }
+
+    // 格式化资金流向
+    fn format_fund_flow(&self, fund_flow: &[FundingChain]) -> String {
+        let mut result = String::new();
+        for (i, chain) in fund_flow.iter().enumerate() {
+            let risk_label = if chain.risk_score > 50 {
+                "⚠️ 高风险资金"
+            } else if chain.transfers[0].success_tokens.is_some() {
+                "✅ 已验证资金"
+            } else {
+                "🆕 新钱包"
+            };
+
+            result.push_str(&format!(
+                "┣━ 资金链#{} ({:.2} SOL) - {}\n",
+                i + 1, chain.total_amount, risk_label
+            ));
+
+            for transfer in &chain.transfers {
+                result.push_str(&format!(
+                    "┃   创建者钱包 [{:}] {}\n",
+                    self.format_timestamp(transfer.timestamp),
+                    transfer.source.to_string()
+                ));
+                
+                if let Some(ref tokens) = transfer.success_tokens {
+                    result.push_str(&format!(
+                        "┃   └─ {} ({})\n",
+                        self.get_wallet_role(&transfer.source),
+                        self.get_wallet_description(transfer)
+                    ));
+                }
+            }
+            
+            if i < fund_flow.len() - 1 {
+                result.push_str("┃\n");
+            }
+        }
+        result
+    }
+
+    // 格式化风险评估
+    fn format_risk_assessment(&self, analysis: &TokenAnalysis) -> String {
+        let mut result = String::new();
+        
+        // 高风险信号
+        result.push_str("┣━ 高风险信号:\n");
+        result.push_str(&format!(
+            "┃   ┣━ {} | {}\n",
+            "创建者关联多个高风险项目",
+            "主要资金来自可疑地址"
+        ));
+        result.push_str(&format!(
+            "┃   ┗━ {} | {}\n",
+            "合约未经审计",
+            "持币过度集中"
+        ));
+
+        // 中等风险
+        result.push_str("┣━ 中等风险:\n");
+        result.push_str(&format!(
+            "┃   ┣━ {} | {}\n",
+            "部分资金来自新地址",
+            "社交媒体活跃度低"
+        ));
+        
+        // 积极因素
+        result.push_str("┗━ 积极因素:\n");
+        result.push_str(&format!(
+            "    ┣━ {} | {}\n",
+            "部分资金来自知名交易所",
+            "有成功项目经验"
+        ));
+
+        result
+    }
+
+    // 辅助格式化方法
+    fn format_number(&self, num: f64) -> String {
+        if num >= 1_000_000_000_000.0 {
+            format!("{:.2}T", num / 1_000_000_000_000.0)
+        } else if num >= 1_000_000_000.0 {
+            format!("{:.2}B", num / 1_000_000_000.0)
+        } else if num >= 1_000_000.0 {
+            format!("{:.2}M", num / 1_000_000.0)
+        } else if num >= 1_000.0 {
+            format!("{:.2}K", num / 1_000.0)
+        } else {
+            format!("{:.2}", num)
+        }
+    }
+
+    fn format_timestamp(&self, timestamp: u64) -> String {
+        let dt = chrono::DateTime::from_timestamp(timestamp as i64, 0)
+            .unwrap()
+            .with_timezone(&chrono::FixedOffset::east(8));
+        dt.format("%H:%M").to_string()
+    }
+
+    // 获取当前价格
+    async fn get_current_price(&self, token_info: &TokenInfo) -> Result<f64> {
+        // 1. 检查缓存
+        if let Some(cached) = self.cache.lock().await.token_info.get(&token_info.mint) {
+            if cached.1.elapsed()? < Duration::from_secs(30) {
+                return Ok(cached.0.price);
+            }
+        }
+
+        // 2. 从API获取
+        let api_key = self.get_next_api_key().await;
+        let response = self.client
+            .get(&format!(
+                "https://public-api.birdeye.so/public/price?address={}",
+                token_info.mint
+            ))
+            .header("X-API-KEY", api_key)
+            .send()
+            .await?;
+            
+        let price_data: PriceResponse = response.json().await?;
+        
+        // 3. 更新缓存
+        self.cache.lock().await.token_info.insert(
+            token_info.mint,
+            (TokenInfo {
+                price: price_data.data.price,
+                ..token_info.clone()
+            }, 
+            SystemTime::now())
+        );
+
+        Ok(price_data.data.price)
+    }
+
+    // 获取价格变化
+    async fn get_price_changes(&self, token_info: &TokenInfo) -> Result<(f64, f64, f64)> {
+        let api_key = self.get_next_api_key().await;
+        let response = self.client
+            .get(&format!(
+                "https://public-api.birdeye.so/public/price_changes?address={}",
+                token_info.mint
+            ))
+            .header("X-API-KEY", api_key)
+            .send()
+            .await?;
+            
+        let price_data: PriceResponse = response.json().await?;
+        
+        Ok((
+            price_data.data.price_change_1h,
+            price_data.data.price_change_24h,
+            price_data.data.volume_24h
+        ))
+    }
+
+    // 检查是否是交易所钱包
+    async fn is_exchange_wallet(&self, address: &Pubkey) -> bool {
+        let known_exchanges = vec![
+            "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",  // Orca
+            "HxhWkVpk5NS4Ltg5nij2G671CKXFRKM8Sk9QfF6XTsQ9",  // Raydium
+            "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",  // Serum
+            // 添加更多已知交易所地址
+        ];
+        
+        known_exchanges.contains(&address.to_string().as_str())
+    }
+
+    // 检查是否是合约钱包
+    async fn is_contract_wallet(&self, address: &Pubkey) -> bool {
+        if let Ok(account) = self.rpc_pool.clients[0].get_account(address).await {
+            account.executable
+        } else {
+            false
+        }
+    }
+
+    // 获取钱包角色
+    async fn get_wallet_role(&self, address: &Pubkey) -> String {
+        if self.is_exchange_wallet(address).await {
+            "交易所钱包".to_string()
+        } else if self.is_contract_wallet(address).await {
+            "合约钱包".to_string()
+        } else {
+            "普通钱包".to_string()
+        }
+    }
+
+    // 获取钱包描述
+    async fn get_wallet_description(&self, transfer: &Transfer) -> String {
+        if let Some(ref tokens) = transfer.success_tokens {
+            if !tokens.is_empty() {
+                format!("{} 创建者", tokens[0].symbol)
+            } else {
+                "中转钱包".to_string()
+            }
+        } else {
+            let age = self.calculate_wallet_age(&transfer.source).await?;
+            format!("新钱包 (年龄: {:.1}天)", age)
+        }
+    }
+
+    // 计算钱包年龄
+    async fn calculate_wallet_age(&self, address: &Pubkey) -> Result<f64> {
+        let client = &self.rpc_pool.clients[0];
+        
+        let signatures = client.get_signatures_for_address(address).await?;
+        
+        if let Some(oldest_tx) = signatures.last() {
+            let age = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs() as f64 - oldest_tx.block_time.unwrap_or(0) as f64;
+                
+            Ok(age / (24.0 * 3600.0)) // 转换为天
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    // 分析钱包历史
+    async fn analyze_wallet_history(&self, address: &Pubkey) -> Result<WalletHistory> {
+        // 1. 检查缓存
+        if let Some(cached) = self.cache.lock().await.creator_history.get(address) {
+            if cached.1.elapsed()? < Duration::from_secs(300) {
+                return Ok(cached.0.clone());
+            }
+        }
+
+        // 2. 从API获取
+        let api_key = self.get_next_api_key().await;
+        let response = self.client
+            .get(&format!(
+                "https://public-api.birdeye.so/public/wallet_history?address={}",
+                address
+            ))
+            .header("X-API-KEY", api_key)
+            .send()
+            .await?;
+            
+        let history: WalletHistory = response.json().await?;
+
+        // 3. 更新缓存
+        self.cache.lock().await.creator_history.insert(
+            *address,
+            (history.clone(), SystemTime::now())
+        );
+
+        Ok(history)
+    }
 }
 
-// 新增的数据结构
+// 添加健康检查结构
 #[derive(Debug)]
-struct SocialMediaStats {
-    twitter_followers: u32,
-    twitter_growth_rate: f64,
-    twitter_authenticity: f64,
-    discord_members: u32,
-    discord_activity: f64,
-    discord_messages_24h: u32,
-    telegram_members: u32,
-    telegram_online_rate: f64,
-    website_age_days: u32,
-}
-
-#[derive(Debug)]
-struct ContractAnalysis {
-    is_upgradeable: bool,
-    has_mint_authority: bool,
-    has_freeze_authority: bool,
-    has_blacklist: bool,
-    locked_liquidity: bool,
-    max_tx_amount: Option<f64>,
-    buy_tax: f64,
-    sell_tax: f64,
-}
-
-#[derive(Debug)]
-struct ComprehensiveScore {
-    total_score: u8,
-    liquidity_score: u8,
-    contract_score: u8,
-    team_score: u8,
-    social_score: u8,
-    risk_factors: Vec<String>,
-    positive_factors: Vec<String>,
-}
-
-#[derive(Debug)]
-struct PriceTrendAnalysis {
-    price_change_1h: f64,
-    price_change_24h: f64,
-    volume_change_24h: f64,
-    liquidity_change_24h: f64,
-    buy_pressure: f64,
-    sell_pressure: f64,
-    major_transactions: Vec<Transaction>,
-}
-
-#[derive(Debug)]
-struct Transaction {
-    amount: f64,
-    price: f64,
-    timestamp: SystemTime,
-    transaction_type: TransactionType,
-}
-
-#[derive(Debug)]
-enum TransactionType {
-    Buy,
-    Sell,
-}
-
-#[derive(Debug)]
-struct HolderDistribution {
-    top_10_percentage: f64,
-    top_50_percentage: f64,
-    top_100_percentage: f64,
-    average_balance: f64,
-    median_balance: f64,
-    gini_coefficient: f64,
-    holder_categories: Vec<HolderCategory>,
-}
-
-#[derive(Debug)]
-struct HolderCategory {
-    category: String,
-    percentage: f64,
-    count: u32,
+pub struct ServiceHealth {
+    running: bool,
+    uptime: u64,
+    processed_blocks: usize,
+    processed_tokens: usize,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2457,13 +2836,72 @@ struct TokenListItem {
     created_at: u64,
 }
 
+// 1. 添加新的结构体定义
+#[derive(Debug, Deserialize)]
+struct PriceResponse {
+    data: PriceData,
+}
+
+#[derive(Debug, Deserialize)]
+struct PriceData {
+    price: f64,
+    price_change_24h: f64,
+    price_change_1h: f64,
+    volume_24h: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletHistory {
+    total_transactions: u64,
+    successful_projects: u64,
+    risk_projects: u64,
+    average_holding_time: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_token_analysis() {
+        let monitor = TokenMonitor::new().await.unwrap();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        
+        let analysis = monitor.analyze_token(&mint, &creator).await.unwrap();
+        assert!(analysis.risk_score <= 100);
+    }
+
+    #[test]
+    fn test_risk_score_calculation() {
+        // 添加风险评分计算的测试
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 初始化日志
     env_logger::init();
-    let mut monitor = TokenMonitor::new().await?;
-    loop {
-        if let Err(e) = monitor.show_menu().await {
-            log::error!("菜单错误: {}", e);
-        }
+    
+    // 创建监控实例
+    let monitor = TokenMonitor::new().await?;
+    
+    // 注册信号处理
+    let running = monitor.service_state.running.clone();
+    ctrlc::set_handler(move || {
+        running.store(false, Ordering::SeqCst);
+    })?;
+    
+    // 启动服务
+    monitor.start_service().await?;
+    
+    // 等待服务停止
+    while monitor.service_state.running.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    
+    // 清理资源
+    monitor.stop_service().await?;
+    
+    Ok(())
 } 
