@@ -22,7 +22,7 @@ lru = "0.12"
 futures = "0.3"
 dashmap = "5.5"
 thiserror = "1.0"
-atomic_float = "0.1"
+atomic-float = "0.1"
 ctrlc = "3.4"
 
 [profile.release]
