@@ -223,7 +223,7 @@ pub struct RpcManager {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct MonitorState {
-    last_slot: u64,
+    last_update: TimeWrapper,
     processed_blocks: u64,
     processed_tokens: u64,
     alerts: Vec<Alert>,
@@ -360,7 +360,7 @@ impl AsyncLogger {
 //===========================================
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct MonitorState {
-    last_slot: u64,
+    last_update: TimeWrapper,
     processed_blocks: u64,
     processed_tokens: u64,
     alerts: Vec<Alert>,
@@ -959,16 +959,26 @@ impl TokenMonitor {
 
     async fn analyze_token(&self, mint: &Pubkey) -> Result<TokenAnalysis> {
         let token_info = self.get_token_info(mint).await?;
-        let creator = self.get_token_creator(mint).await?;
-        let analysis = TokenAnalysis::new(token_info);
-        Ok(analysis)
+        let social = self.analyze_social_media(&token_info.symbol).await?;
+        let distribution = self.analyze_holder_distribution(mint).await?;
+        let fund_flow = self.analyze_funding_flow(mint).await?;
+
+        Ok(TokenAnalysis {
+            token_info,
+            social,
+            holder_distribution: distribution,
+            fund_flow,
+            ..TokenAnalysis::default()
+        })
     }
 
     async fn get_token_info(&self, mint: &Pubkey) -> Result<TokenInfo> {
         if let Some(cached) = self.cache.token_info.get(mint) {
             return Ok(cached.0.clone());
         }
-        self.fetch_token_info(mint).await
+        
+        // 实现获取 token 信息的逻辑
+        Err(anyhow!("Token info not found"))
     }
 
     async fn get_token_creator(&self, mint: &Pubkey) -> Result<Pubkey> {
@@ -1531,25 +1541,82 @@ r#"🔗 快速链接 (点击复制)
             .to_string()
     }
 
-    async fn analyze_social_media(&self, symbol: &String) -> Result<SocialMediaStats> {
+    async fn analyze_social_media(&self, symbol: &str) -> Result<SocialMediaStats> {
         let client = reqwest::Client::new();
         let url = format!("https://api.birdeye.so/social/{}", symbol);
         let res = client.get(url).send().await?;
-        let body = res.text().await?;
-        let json: serde_json::Value = serde_json::from_str(&body)?;
-        let twitter_followers = json["data"]["twitter"]["followers"].as_u64().unwrap_or(0);
-        let twitter_growth = json["data"]["twitter"]["growth"].as_f64().unwrap_or(0.0);
-        let discord_members = json["data"]["discord"]["members"].as_u64().unwrap_or(0);
-        let discord_activity = json["data"]["discord"]["activity"].as_f64().unwrap_or(0.0);
-        let telegram_members = json["data"]["telegram"]["members"].as_u64().unwrap_or(0);
+        let data = res.json::<SocialResponse>().await?;
         
         Ok(SocialMediaStats {
-            twitter_followers,
-            twitter_growth,
-            discord_members,
-            discord_activity,
-            telegram_members,
+            twitter_followers: data.twitter.followers,
+            twitter_growth: data.twitter.growth,
+            discord_members: data.discord.members,
+            discord_activity: data.discord.activity,
+            telegram_members: data.telegram.members,
         })
+    }
+
+    async fn analyze_holder_distribution(&self, mint: &Pubkey) -> Result<HolderDistribution> {
+        // 完整的实现
+        let holders = self.fetch_holders(mint).await?;
+        let distribution = self.calculate_distribution(&holders);
+        
+        // 添加更多分析逻辑
+        let mut holder_categories = Vec::new();
+        let mut exchange_count = 0;
+        let mut whale_count = 0;
+        let mut market_maker_count = 0;
+
+        for holder in holders {
+            if self.is_exchange_wallet(&holder.address) {
+                exchange_count += 1;
+            }
+            if holder.balance > 1000.0 {  // 假设1000作为大户标准
+                whale_count += 1;
+            }
+            if self.is_market_maker(&holder.address) {
+                market_maker_count += 1;
+            }
+
+            holder_categories.push(HolderCategory {
+                address: holder.address,
+                balance: holder.balance,
+                category: self.categorize_holder(&holder),
+                last_activity: holder.last_activity,
+            });
+        }
+
+        Ok(HolderDistribution {
+            exchanges: distribution.exchanges,
+            whales: distribution.whales,
+            retail: distribution.retail,
+            inactive: distribution.inactive,
+            top_10_percentage: distribution.top_10_percentage,
+            top_50_percentage: distribution.top_50_percentage,
+            top_100_percentage: distribution.top_100_percentage,
+            holder_categories,
+            exchange_count,
+            whale_count,
+            market_maker_count,
+        })
+    }
+
+    // 添加辅助函数
+    fn categorize_holder(&self, holder: &HolderInfo) -> String {
+        if self.is_exchange_wallet(&holder.address) {
+            "Exchange".to_string()
+        } else if holder.balance > 1000.0 {
+            "Whale".to_string()
+        } else if self.is_market_maker(&holder.address) {
+            "Market Maker".to_string()
+        } else {
+            "Retail".to_string()
+        }
+    }
+
+    fn is_market_maker(&self, address: &Pubkey) -> bool {
+        // 实现市场做市商检测逻辑
+        false
     }
 
     async fn analyze_contract(&self, mint: &Pubkey) -> ContractAnalysis {
@@ -1602,32 +1669,6 @@ r#"🔗 快速链接 (点击复制)
                 // ... 其他重要交易
             ],
         }
-    }
-
-    async fn analyze_holder_distribution(&self, mint: &Pubkey) -> Result<HolderDistribution> {
-        let client = reqwest::Client::new();
-        let url = format!("https://api.birdeye.so/token/holders?address={}", mint);
-        let res = client.get(url).send().await?;
-        let body = res.text().await?;
-        let json: serde_json::Value = serde_json::from_str(&body)?;
-        let exchanges = json["data"]["exchanges"].as_f64().unwrap_or(0.0);
-        let whales = json["data"]["whales"].as_f64().unwrap_or(0.0);
-        let retail = json["data"]["retail"].as_f64().unwrap_or(0.0);
-        let inactive = json["data"]["inactive"].as_f64().unwrap_or(0.0);
-        
-        Ok(HolderDistribution {
-            exchanges,
-            whales,
-            retail,
-            inactive,
-            top_10_percentage: 0.0,
-            top_50_percentage: 0.0,
-            top_100_percentage: 0.0,
-            holder_categories: vec![],
-            exchange_count: 0,
-            whale_count: 0,
-            market_maker_count: 0,
-        })
     }
 
     fn test_monitor_output(&self) {
@@ -2411,8 +2452,12 @@ r#"🔗 快速链接 (点击复制)
     fn process_transaction(&self, tx: &EncodedTransaction) -> Result<()> {
         match tx {
             EncodedTransaction::Json(tx_json) => {
-                let message = &tx_json.message;
-                // ...
+                if let Some(message) = &tx_json.message {
+                    // 处理 message
+                    if message.account_keys.contains(&self.pump_program) {
+                        // 处理 pump 交易
+                    }
+                }
                 Ok(())
             },
             _ => Ok(())
@@ -2634,6 +2679,30 @@ r#"🔗 快速链接 (点击复制)
             price_change_initial: 0.0,
         };
         Ok(analysis)
+    }
+
+    fn format_analysis(&self, analysis: &TokenAnalysis) -> String {
+        format!(
+            "Token: {} ({})\nMarket Cap: ${:.2}M\n",
+            analysis.token_info.name,
+            analysis.token_info.symbol,
+            analysis.token_info.market_cap / 1_000_000.0
+        )
+    }
+
+    fn generate_notification(&self, analysis: &TokenAnalysis) -> String {
+        format!(
+            ">>> 发现新代币 - 高度关注! 🚨\n\
+            ┏━━━━━━━━━━━━━━━━━━━━━ 🔔 新代币分析报告 (UTC+8) ━━━━━━━━━━━━━━━━━━━━━┓\n\n\
+            📋 合约信息\n\
+            ┣━ 代币: {} ({})\n\
+            ┣━ 合约地址: {} 📋\n\
+            ┗━ 创建者钱包: {} 📋\n\n",
+            analysis.token_info.symbol,
+            analysis.token_info.name,
+            analysis.token_info.mint.to_string(),  // 使用完整地址
+            analysis.token_info.creator.to_string()  // 使用完整地址
+        )
     }
 }
 
@@ -2938,6 +3007,102 @@ pub struct Recovery {
     pub last_checkpoint: SystemTime,
     pub retry_count: AtomicUsize,
     pub error_log: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactionMessage {
+    pub account_keys: Vec<Pubkey>,
+    pub recent_blockhash: String,
+    pub instructions: Vec<TransactionInstruction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactionInstruction {
+    pub program_id: Pubkey,
+    pub accounts: Vec<Pubkey>,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimeWrapper(SystemTime);
+
+impl Default for TimeWrapper {
+    fn default() -> Self {
+        Self(SystemTime::now())
+    }
+}
+
+// 在需要 Default 的结构体中使用 TimeWrapper
+#[derive(Debug, Default)]
+struct MonitorState {
+    last_update: TimeWrapper,
+    processed_blocks: u64,
+    processed_tokens: u64,
+    alerts: Vec<Alert>,
+    watch_addresses: HashSet<String>,
+    metrics: MonitorMetrics,
+    start_time: SystemTime,
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialResponse {
+    twitter: SocialPlatform,
+    discord: SocialPlatform,
+    telegram: SocialPlatform,
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialPlatform {
+    followers: u64,
+    growth: f64,
+    members: u64,
+    activity: f64,
+}
+
+#[derive(Debug)]
+struct HolderInfo {
+    address: Pubkey,
+    balance: f64,
+    last_activity: SystemTime,
+}
+
+#[derive(Debug)]
+struct Transaction {
+    amount: f64,
+    price: f64,
+    timestamp: SystemTime,
+    transaction_type: TransactionType,
+}
+
+// 添加 Default 实现
+impl Default for HolderInfo {
+    fn default() -> Self {
+        Self {
+            address: Pubkey::default(),
+            balance: 0.0,
+            last_activity: SystemTime::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Transaction {
+    amount: f64,
+    price: f64,
+    timestamp: SystemTime,
+    transaction_type: TransactionType,
+}
+
+// 添加 Default 实现
+impl Default for Transaction {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            price: 0.0,
+            timestamp: SystemTime::now(),
+            transaction_type: TransactionType::Transfer,
+        }
+    }
 }
 
 #[cfg(test)]
