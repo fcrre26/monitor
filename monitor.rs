@@ -50,18 +50,23 @@ use log4rs::{
 };
 use std::sync::Mutex as StdMutex;
 
-#[derive(Debug, Clone)]
-struct AppConfig {
-    api_keys: Vec<String>,
-    serverchan: ServerChanConfig,
-    wcf: WeChatFerryConfig,
-    proxy: ProxyConfig,
-    rpc_nodes: HashMap<String, RpcNodeConfig>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub api_keys: Vec<String>,
+    pub serverchan: ServerChanConfig,
+    pub wcf: WeChatFerryConfig,
+    pub proxy: ProxyConfig,
+    pub rpc_nodes: HashMap<String, RpcNodeConfig>,
 }
 
 impl AppConfig {
-    fn builder() -> ConfigBuilder {
-        ConfigBuilder::default()
+    pub fn load() -> Result<Self> {
+        let config_path = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Home directory not found"))?
+            .join(".solana_pump/config.json");
+            
+        let content = fs::read_to_string(config_path)?;
+        Ok(serde_json::from_str(&content)?)
     }
 }
 
@@ -246,6 +251,11 @@ pub struct TokenInfo {
     pub market_cap: f64,
     pub liquidity: f64,
     pub holder_count: u64,
+    pub holder_concentration: f64,
+    pub verified: bool,
+    pub price: f64,
+    pub supply: u64,
+    pub creator: Pubkey,
 }
 
 //===========================================
@@ -307,26 +317,11 @@ struct LogMessage {
 
 impl AsyncLogger {
     async fn new() -> Result<Self> {
-        let (tx, mut rx) = mpsc::channel(1000);
+        let (tx, mut rx): (mpsc::Sender<LogMessage>, mpsc::Receiver<LogMessage>) = mpsc::channel(1000);
         
-        // 启动日志处理线程
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                let level_str = match msg.level {
-                    log::Level::Error => "ERROR".red(),
-                    log::Level::Warn => "WARN".yellow(),
-                    log::Level::Info => "INFO".green(),
-                    log::Level::Debug => "DEBUG".blue(),
-                    log::Level::Trace => "TRACE".normal(),
-                };
-
-                println!(
-                    "{} [{}] {}",
-                    chrono::DateTime::<chrono::Local>::from(msg.timestamp)
-                        .format("%Y-%m-%d %H:%M:%S"),
-                    level_str,
-                    msg.content
-                );
+                // 处理日志消息
             }
         });
 
@@ -463,8 +458,8 @@ pub struct ServiceState {
     pub processed_tokens: Arc<AtomicUsize>,
 }
 
-impl ServiceState {
-    fn new() -> Self {
+impl Default for ServiceState {
+    fn default() -> Self {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             last_error: Arc::new(StdMutex::new(None)),
@@ -475,24 +470,25 @@ impl ServiceState {
     }
 }
 
-struct TokenMonitor {
-    config: AppConfig,
-    rpc_pool: Arc<RpcPool>,
-    cache: Arc<TokioMutex<CacheSystem>>,
-    logger: Arc<AsyncLogger>,
-    batcher: Arc<SmartBatcher>,
-    metrics: Arc<TokioMutex<Metrics>>,
-    pump_program: Pubkey,
-    client: reqwest::Client,
-    current_api_key: Arc<Mutex<usize>>,
-    request_counts: DashMap<String, u32>,
-    last_reset: DashMap<String, SystemTime>,
-    watch_addresses: HashSet<String>,
-    monitor_state: Arc<TokioMutex<MonitorState>>,
-    proxy_pool: Arc<TokioMutex<ProxyPool>>,
+#[derive(Debug)]
+pub struct TokenMonitor {
+    pub config: AppConfig,
+    pub rpc_pool: Arc<RpcPool>,
+    pub cache: Arc<TokioMutex<CacheSystem>>,
+    pub logger: Arc<AsyncLogger>,
+    pub batcher: Arc<SmartBatcher>,
+    pub metrics: Arc<TokioMutex<Metrics>>,
+    pub pump_program: Pubkey,
+    pub client: reqwest::Client,
+    pub current_api_key: Arc<Mutex<usize>>,
+    pub request_counts: DashMap<String, u32>,
+    pub last_reset: DashMap<String, SystemTime>,
+    pub watch_addresses: HashSet<String>,
+    pub monitor_state: Arc<TokioMutex<MonitorState>>,
+    pub proxy_pool: Arc<TokioMutex<ProxyPool>>,
     // 添加服务状态管理
-    service_state: Arc<ServiceState>,
-    last_alert: tokio::sync::Mutex<SystemTime>,
+    pub service_state: Arc<ServiceState>,
+    pub last_alert: tokio::sync::Mutex<SystemTime>,
 }
 
 impl Clone for TokenMonitor {
@@ -543,6 +539,11 @@ struct TokenInfo {
     pub market_cap: f64,
     pub liquidity: f64,
     pub holder_count: u64,
+    pub holder_concentration: f64,
+    pub verified: bool,
+    pub price: f64,
+    pub supply: u64,
+    pub creator: Pubkey,
 }
 
 #[derive(Debug, Default)]
@@ -701,7 +702,7 @@ impl TokenMonitor {
             watch_addresses: HashSet::new(),
             monitor_state: Arc::new(TokioMutex::new(MonitorState::default())),
             proxy_pool,
-            service_state: Arc::new(ServiceState::new()),
+            service_state: Arc::new(ServiceState::default()),
             last_alert: tokio::sync::Mutex::new(SystemTime::now()),
         };
 
@@ -1979,7 +1980,8 @@ r#"🔗 快速链接 (点击复制)
     }
 
     async fn save_monitor_state(&self) -> Result<()> {
-        let state_file = dirs::home_dir()?
+        let state_file = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Home directory not found"))?
             .join(".solana_pump/state.json");
             
         let state = self.monitor_state.lock().await;
@@ -2129,9 +2131,7 @@ r#"🔗 快速链接 (点击复制)
 
     fn format_short_address(&self, address: &Pubkey) -> String {
         let addr_str = address.to_string();
-        format!("{}...{}", 
-            &addr_str[..4], 
-            &addr_str[addr_str.len()-4..])
+        format!("{}...{}", &addr_str[..4], &addr_str[addr_str.len()-4..])
     }
 
     async fn send_alert(&self, title: &str, content: &str) {
@@ -2357,7 +2357,6 @@ r#"🔗 快速链接 (点击复制)
     }
 
     fn calculate_time_diff(&self, now: u64, t: u64) -> bool {
-        // 修改为同类型比较
         now.saturating_sub(t) < 3600
     }
 
@@ -2451,7 +2450,11 @@ r#"🔗 快速链接 (点击复制)
 
     // 1. 修复借用存活期
     async fn process_cached_blocks(&self) -> Result<()> {
-        let blocks: Vec<_> = self.cache.blocks.iter().map(|entry| *entry.key()).collect();
+        let blocks: Vec<_> = {
+            let cache = self.cache.lock().await;
+            cache.blocks.iter().map(|entry| *entry.key()).collect()
+        };
+        
         for slot in blocks {
             self.process_block(slot).await?;
         }
@@ -2472,6 +2475,11 @@ r#"🔗 快速链接 (点击复制)
         fn update_health_status(&self, url: String, status: bool) {
             self.health_status.insert(url, status);
         }
+
+        fn add_client(&self, client: RpcClient) {
+            let mut clients = self.clients.lock().unwrap();
+            clients.push(Arc::new(client));
+        }
     }
 
     fn get_next_rpc_client(&self) -> Arc<RpcClient> {
@@ -2482,6 +2490,76 @@ r#"🔗 快速链接 (点击复制)
         let mut metrics = self.metrics.lock().await;
         metrics.processed_blocks += 1;
         Ok(())
+    }
+
+    fn init_logger() -> Result<()> {
+        let console = ConsoleAppender::builder()
+            .encoder(Box::new(PatternEncoder::new("{d} {l} {t} - {m}{n}")))
+            .build();
+
+        let config = Config::builder()
+            .appender(Appender::builder().build("console", Box::new(console)))
+            .build(Root::builder().appender("console").build(LevelFilter::Info))
+            .unwrap();
+
+        log4rs::init_config(config)?;
+        Ok(())
+    }
+
+    fn load_proxy_list() -> Result<Vec<ProxyConfig>> {
+        let config_path = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Failed to get home directory"))?
+            .join(".solana_pump/proxies.json");
+            
+        let content = fs::read_to_string(config_path)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    fn load_watch_addresses() -> Result<HashSet<String>> {
+        let path = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Failed to get home directory"))?
+            .join(".solana_pump/watch_addresses.txt");
+            
+        let content = fs::read_to_string(path)?;
+        Ok(content.lines().map(String::from).collect())
+    }
+
+    fn format_fund_flow(&self, fund_flow: &[FundingChain]) -> String {
+        fund_flow.iter()
+            .map(|chain| format!(
+                "金额: {} SOL\n来源: {}\n目标: {}\n风险: {}\n",
+                chain.total_amount,
+                self.format_short_address(&Pubkey::from_str(&chain.source_wallet).unwrap()),
+                self.format_short_address(&Pubkey::from_str(&chain.destination_wallet).unwrap()),
+                chain.risk_level
+            ))
+            .collect()
+    }
+
+    fn create_funding_chain(&self, transfer: Transfer) -> FundingChain {
+        FundingChain {
+            total_amount: transfer.amount,
+            transfers: vec![transfer],
+            risk_level: 0,
+            source_wallet: String::new(),
+            intermediate_wallet: String::new(),
+            destination_wallet: String::new(),
+        }
+    }
+
+    fn update_request_count(&self, key: &str) -> u32 {
+        let mut entry = self.request_counts.entry(key.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    fn update_health_status(&self, url: String, status: bool) {
+        self.health_status.insert(url, status);
+    }
+
+    async fn update_cache(&self, mint: Pubkey, info: TokenInfo) {
+        let mut cache = self.cache.lock().await;
+        cache.token_info.put(mint, (info, SystemTime::now()));
     }
 }
 
@@ -2694,6 +2772,61 @@ pub enum AlertLevel {
     High,
     Medium,
     Low,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationData {
+    pub title: String,
+    pub message: String,
+    pub level: AlertLevel,
+    pub timestamp: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContractAnalysis {
+    pub verified: bool,
+    pub audit_status: String,
+    pub risk_level: u8,
+    pub code_quality: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PriceTrendAnalysis {
+    pub price_change_1h: f64,
+    pub price_change_24h: f64,
+    pub volume_change: f64,
+    pub trend_direction: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComprehensiveScore {
+    pub total_score: u8,
+    pub risk_score: u8,
+    pub social_score: u8,
+    pub market_score: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct HolderCategory {
+    pub address: Pubkey,
+    pub balance: f64,
+    pub category: String,
+    pub last_activity: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub enum TransactionType {
+    Buy,
+    Sell,
+    Transfer,
+    Liquidity,
+}
+
+#[derive(Debug)]
+pub struct Recovery {
+    pub last_checkpoint: SystemTime,
+    pub retry_count: AtomicUsize,
+    pub error_log: Vec<String>,
 }
 
 #[cfg(test)]
