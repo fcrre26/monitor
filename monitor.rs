@@ -1784,9 +1784,9 @@ impl TokenMonitor {
 
                 // 重新配置日志级别
                 let log_dir = dirs::home_dir()?.join(".solana_pump/logs");
-                let config = Config::builder()
+                let config = log4rs::Config::builder()
                     .appender(
-                        Appender::builder()
+                        log4rs::config::Appender::builder()
                             .build(
                                 "rolling",
                                 Box::new(
@@ -1804,13 +1804,13 @@ impl TokenMonitor {
                                                             log_dir.join("solana_pump.{}.log").to_str().unwrap(),
                                                             5,
                                                         )?
-                                                ),
+                                                )
                                             ))
                                         )?
                             )
                         )
                     )?
-                    .build(Root::builder().appender("rolling").build(level_filter)))?;
+                    .build(Root::builder().appender("rolling").build(level_filter))?;
 
                 log4rs::init_config(config)?;
                 println!("日志级别已更新");
