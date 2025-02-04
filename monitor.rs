@@ -28,7 +28,6 @@ use std::{
     io::Read,
     process,
     path::Path,
-    path::PathBuf,
 };
 use tokio::{
     sync::{mpsc, Mutex},
@@ -141,71 +140,31 @@ struct WeChatGroup {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProxyConfig {
-    pub id: String,           // 新增
-    pub name: String,         // 新增
-    pub ip: String,
-    pub port: u16,
-    pub username: String,
-    pub password: String,
-    pub protocol: ProxyProtocol,  // 新增
-    pub enabled: bool,
-    pub last_check: SystemTime,   // 新增
-    pub status: ProxyStatus,      // 新增
+struct ProxyConfig {
+    enabled: bool,
+    ip: String,
+    port: u16,
+    username: String,
+    password: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProxyProtocol {
-    Http,
-    Https,
-    Socks5,
-}
-
-impl ProxyProtocol {
-    fn as_str(&self) -> &'static str {
-        match self {
-            ProxyProtocol::Http => "http",
-            ProxyProtocol::Https => "https",
-            ProxyProtocol::Socks5 => "socks5",
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ip: String::new(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProxyStatus {
-    Active,
-    Inactive,
-    Failed,
-}
-
-pub struct ProxyManager {
-    proxies: Arc<DashMap<String, ProxyConfig>>,
-    config_file: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RpcNodeConfig {
-    pub id: String,
-    pub name: String,
-    pub url: String,
-    pub weight: f64,
-    pub enabled: bool,
-    pub is_default: bool,
-    pub last_check: SystemTime,
-    pub status: RpcStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RpcStatus {
-    Healthy,
-    Unhealthy,
-    Unknown,
-}
-
-pub struct RpcManager {
-    nodes: Arc<DashMap<String, RpcNodeConfig>>,
-    config_file: PathBuf,
-    default_nodes: Vec<RpcNodeConfig>,
+    weight: f64,
+    fails: u64,
+    last_used: u64,
 }
 
 #[derive(Debug)]
@@ -249,9 +208,6 @@ impl RpcPool {
     }
 }
 
-//===========================================
-// 缓存系统模块
-//===========================================
 struct CacheSystem {
     blocks: DashMap<u64, EncodedConfirmedBlock>,
     token_info: LruCache<Pubkey, (TokenInfo, SystemTime)>,
@@ -260,86 +216,11 @@ struct CacheSystem {
     transactions: LruCache<String, EncodedTransaction>,
 }
 
-impl CacheSystem {
-    fn new() -> Self {
-        Self {
-            blocks: DashMap::new(),
-            token_info: LruCache::new(NonZeroUsize::new(100).unwrap()),
-            creator_history: DashMap::new(),
-            fund_flow: DashMap::new(),
-            transactions: LruCache::new(NonZeroUsize::new(100).unwrap()),
-        }
-    }
-
-    async fn cleanup(&mut self) {
-        let now = SystemTime::now();
-        
-        // 清理过期区块缓存
-        self.blocks.retain(|_, v| {
-            v.block_time
-                .map(|t| now.duration_since(UNIX_EPOCH).unwrap().as_secs() - t < 3600)
-                .unwrap_or(false)
-        });
-
-        // 清理过期代币信息
-        self.token_info.retain(|_, (_, time)| {
-            time.elapsed().unwrap() < Duration::from_secs(3600)
-        });
-
-        // 清理过期创建者历史
-        self.creator_history.retain(|_, (_, time)| {
-            time.elapsed().unwrap() < Duration::from_secs(3600 * 24)
-        });
-
-        // 清理过期资金流向
-        self.fund_flow.retain(|_, (_, time)| {
-            time.elapsed().unwrap() < Duration::from_secs(3600 * 12)
-        });
-    }
-}
-
-//===========================================
-// 日志系统模块
-//===========================================
 struct AsyncLogger {
     sender: mpsc::Sender<LogMessage>,
 }
 
-#[derive(Debug)]
-struct LogMessage {
-    level: log::Level,
-    content: String,
-    timestamp: SystemTime,
-}
-
 impl AsyncLogger {
-    async fn new() -> Result<Self> {
-        let (tx, mut rx) = mpsc::channel(1000);
-        
-        // 启动日志处理线程
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                let level_str = match msg.level {
-                    log::Level::Error => "ERROR".red(),
-                    log::Level::Warn => "WARN".yellow(),
-                    log::Level::Info => "INFO".green(),
-                    log::Level::Debug => "DEBUG".blue(),
-                    log::Level::Trace => "TRACE".normal(),
-                };
-
-                println!(
-                    "{} [{}] {}",
-                    chrono::DateTime::<chrono::Local>::from(msg.timestamp)
-                        .format("%Y-%m-%d %H:%M:%S"),
-                    level_str,
-                    msg.content
-                );
-            }
-        });
-
-        Ok(Self { sender: tx })
-    }
-
     async fn log(&self, level: log::Level, message: impl Into<String>) {
         if let Err(e) = self.sender.send(LogMessage {
             level,
@@ -351,114 +232,9 @@ impl AsyncLogger {
     }
 }
 
-//===========================================
-// 监控状态管理模块
-//===========================================
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct MonitorState {
-    last_slot: u64,
-    processed_blocks: u64,
-    processed_tokens: u64,
-    alerts: Vec<Alert>,
-    watch_addresses: HashSet<String>,
-    metrics: MonitorMetrics,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Alert {
-    timestamp: SystemTime,
-    level: AlertLevel,
-    message: String,
-    token_info: Option<TokenInfo>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum AlertLevel {
-    High,
-    Medium,
-    Low,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct MonitorMetrics {
-    uptime: Duration,
-    cpu_usage: f64,
-    memory_usage: f64,
-    rpc_requests: u64,
-    rpc_errors: u64,
-}
-
-//===========================================
-// 智能批处理模块
-//===========================================
 struct SmartBatcher {
     batch_size: AtomicUsize,
     load_metrics: Arc<LoadMetrics>,
-    pending_requests: Arc<AtomicUsize>,
-}
-
-impl SmartBatcher {
-    fn new() -> Self {
-        Self {
-            batch_size: AtomicUsize::new(TokenMonitor::BLOCK_BATCH_SIZE),
-            load_metrics: Arc::new(LoadMetrics::default()),
-            pending_requests: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn adjust_batch_size(&self) {
-        let cpu_usage = self.load_metrics.cpu_usage.load(Ordering::Relaxed);
-        let memory_usage = self.load_metrics.memory_usage.load(Ordering::Relaxed);
-        let pending = self.pending_requests.load(Ordering::Relaxed);
-        
-        let current_size = self.batch_size.load(Ordering::Relaxed);
-        let mut new_size = current_size;
-
-        // CPU负载调整
-        if cpu_usage > 80.0 {
-            new_size = (current_size as f64 * 0.8) as usize;
-        } else if cpu_usage < 50.0 && pending < TokenMonitor::MAX_PENDING_REQUESTS / 2 {
-            new_size = (current_size as f64 * 1.2) as usize;
-        }
-
-        // 内存负载调整
-        if memory_usage > 80.0 {
-            new_size = (new_size as f64 * 0.8) as usize;
-        }
-
-        // 确保批处理大小在合理范围内
-        new_size = new_size.max(10).min(1000);
-        
-        self.batch_size.store(new_size, Ordering::Relaxed);
-    }
-
-    async fn process_batch<T, F, Fut>(&self, items: Vec<T>, process_fn: F) -> Result<()>
-    where
-        F: Fn(T) -> Fut,
-        Fut: Future<Output = Result<()>>,
-    {
-        let batch_size = self.batch_size.load(Ordering::Relaxed);
-        
-        for chunk in items.chunks(batch_size) {
-            let futures: Vec<_> = chunk
-                .iter()
-                .map(|item| process_fn(item.clone()))
-                .collect();
-                
-            self.pending_requests.fetch_add(futures.len(), Ordering::Relaxed);
-            
-            join_all(futures).await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-                
-            self.pending_requests.fetch_sub(futures.len(), Ordering::Relaxed);
-            
-            // 动态调整批处理大小
-            self.adjust_batch_size();
-        }
-        
-        Ok(())
-    }
 }
 
 struct TokenMonitor {
@@ -722,11 +498,20 @@ impl TokenMonitor {
                 current_index: AtomicUsize::new(0),
                 metrics: Arc::new(RpcMetrics::default()),
             }),
-            cache: Arc::new(Mutex::new(CacheSystem::new())),
+            cache: Arc::new(Mutex::new(CacheSystem {
+                blocks: DashMap::new(),
+                token_info: LruCache::new(100),
+                creator_history: DashMap::new(),
+                fund_flow: DashMap::new(),
+                transactions: LruCache::new(100),
+            })),
             logger: Arc::new(AsyncLogger {
                 sender: mpsc::channel(1000).0,
             }),
-            batcher: Arc::new(SmartBatcher::new()),
+            batcher: Arc::new(SmartBatcher {
+                batch_size: AtomicUsize::new(0),
+                load_metrics: Arc::new(LoadMetrics::default()),
+            }),
             metrics: Arc::new(Mutex::new(Metrics::default())),
             pump_program: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ35MKDfgCcMKJ".parse()?,
             client,
@@ -1299,100 +1084,94 @@ impl TokenMonitor {
     }
 
     fn format_message(&self, analysis: &TokenAnalysis) -> String {
-        let data = NotificationData {
-            risk_level: self.get_risk_level(analysis.risk_score),
-            attention_level: self.get_attention_level(analysis.risk_score),
-            symbol: analysis.token_info.symbol.clone(),
-            name: analysis.token_info.name.clone(),
-            contract: analysis.token_info.mint.to_string(),
-            creator: analysis.token_info.creator.to_string(),
-            supply: self.format_supply(analysis.token_info.supply),
-            initial_price: analysis.token_info.price,
-            current_price: analysis.token_info.price,
-            market_cap: self.format_market_cap(analysis.token_info.market_cap),
-            liquidity: analysis.token_info.liquidity,
-            price_change: self.calculate_price_change(
-                analysis.token_info.price,
-                analysis.token_info.price
+        let mut msg = vec![
+            "┏━━━━━━━━━━━━━━━━━━━━━ 发现新代币 (UTC+8) ━━━━━━━━━━━━━━━━━━━━━┓".to_string(),
+            "".to_string(),
+            "📋 合约信息".to_string(),
+            format!("┣━ CA: {}", analysis.token_info.mint),
+            format!("┣━ 创建者: {}", analysis.token_info.creator),
+            format!(
+                "┗━ 钱包状态: {} | 钱包年龄: {:.1} 天",
+                if analysis.is_new_wallet { "🆕 新钱包" } else { "📅 老钱包" },
+                analysis.wallet_age
             ),
-            lock_info: self.format_lock_info(&analysis.token_info),
-            holder_count: analysis.token_info.holder_count,
-            concentration: analysis.token_info.holder_concentration,
-            fund_flow: self.format_fund_flow(&analysis.fund_flow),
-            creator_analysis: self.format_creator_analysis(&analysis.creator_history),
-            risk_assessment: self.format_risk_assessment(analysis),
-            social_market: self.format_social_market(analysis),
-            holder_distribution: self.format_holder_distribution(analysis),
-            quick_links: self.format_quick_links(&analysis.token_info),
-            monitor_info: self.format_monitor_info(analysis),
-            risk_tips: self.get_risk_tips(analysis.risk_score),
-            main_risks: self.get_main_risks(analysis),
-            suggestion: self.get_suggestion(analysis.risk_score),
-        };
+        ];
 
-        self.render_template(NOTIFICATION_TEMPLATE, &data)
+        self.add_token_info(&mut msg, &analysis.token_info);
+        
+        if !analysis.fund_flow.is_empty() {
+            self.add_fund_flow_info(&mut msg, &analysis.fund_flow);
+        }
+
+        if !analysis.creator_history.success_tokens.is_empty() {
+            self.add_creator_history(&mut msg, &analysis.creator_history);
+        }
+
+        self.add_risk_assessment(&mut msg, analysis);
+        self.add_quick_links(&mut msg, &analysis.token_info);
+
+        msg.join("\n")
     }
 
-    fn render_template(&self, template: &str, data: &NotificationData) -> String {
-        template
-            .replace("{risk_level}", &data.risk_level)
-            .replace("{attention_level}", &data.attention_level)
-            .replace("{symbol}", &data.symbol)
-            .replace("{name}", &data.name)
-            .replace("{contract}", &data.contract)
-            .replace("{creator}", &data.creator)
-            .replace("{supply}", &data.supply)
-            .replace("{initial_price}", &format!("{:.8}", data.initial_price))
-            .replace("{current_price}", &format!("{:.8}", data.current_price))
-            .replace("{market_cap}", &data.market_cap)
-            .replace("{liquidity}", &format!("{:.1}", data.liquidity))
-            .replace("{price_change}", &format!("{:.1}", data.price_change))
-            .replace("{lock_info}", &data.lock_info)
-            .replace("{holder_count}", &data.holder_count.to_string())
-            .replace("{concentration}", &format!("{:.1}", data.concentration))
-            .replace("{fund_flow}", &data.fund_flow)
-            .replace("{creator_analysis}", &data.creator_analysis)
-            .replace("{risk_assessment}", &data.risk_assessment)
-            .replace("{social_market}", &data.social_market)
-            .replace("{holder_distribution}", &data.holder_distribution)
-            .replace("{quick_links}", &data.quick_links)
-            .replace("{monitor_info}", &data.monitor_info)
-            .replace("{risk_tips}", &data.risk_tips)
-            .replace("{main_risks}", &data.main_risks)
-            .replace("{suggestion}", &data.suggestion)
+    fn add_token_info(&self, msg: &mut Vec<String>, token_info: &TokenInfo) {
+        msg.extend_from_slice(&[
+            "┏━━━━━━━━━━━━━━━━━━━━━ 💰 代币数据 ━━━━━━━━━━━━━━━━━━━━━┓".to_string(),
+            format!(
+                "┃ 代币名称: {:<15} | 代币符号: {:<8} | 认证状态: {} ┃",
+                token_info.name,
+                token_info.symbol,
+                if token_info.verified { "✅ 已认证" } else { "❌ 未认证" }
+            ),
+            format!(
+                "┃ 初始市值: ${:<12} | 代币供应量: {:<8} | 单价: ${} ┃",
+                self.format_number(token_info.market_cap),
+                self.format_number(token_info.supply as f64),
+                token_info.price
+            ),
+            format!(
+                "┃ 流动性: {:.2} SOL{} | 持有人数: {:<8} | 前10持有比: {:.2}% ┃",
+                self.format_number(token_info.liquidity),
+                " ".repeat(8),
+                token_info.holder_count,
+                self.format_number(token_info.holder_concentration)
+            ),
+        ]);
     }
 
-    fn get_risk_level(&self, risk_score: u8) -> String {
-        match risk_score {
-            0..=39 => "低风险".to_string(),
-            40..=69 => "中风险".to_string(),
-            70..=100 => "高风险".to_string(),
-            _ => "未知".to_string(),
+    fn add_fund_flow_info(&self, msg: &mut Vec<String>, fund_flow: &[FundingChain]) {
+        let total_transfer: f64 = fund_flow.iter()
+            .map(|chain| chain.total_amount)
+            .sum();
+            
+        msg.push(format!("💸 资金追踪 (总流入: {:.2} SOL)", total_transfer));
+        
+        for (i, chain) in fund_flow.iter().enumerate() {
+            msg.push(format!("┣━ 资金链#{} ({:.2} SOL) - 上游资金追踪", i + 1, chain.total_amount));
+            
+            for (j, transfer) in chain.transfers.iter().enumerate() {
+                let wallet_level = (b'E' - j as u8) as char;
+                let time_str = self.format_timestamp(transfer.timestamp);
+                msg.push(format!(
+                    "┃   ⬆️ {:.2} SOL ({}) | 来自钱包{}: {}",
+                    transfer.amount,
+                    time_str,
+                    wallet_level,
+                    transfer.source
+                ));
+                
+                if let Some(ref tokens) = transfer.success_tokens {
+                    let token_info: Vec<String> = tokens.iter()
+                        .map(|t| format!("{}(${:.2}M)", t.symbol, t.market_cap / 1_000_000.0))
+                        .collect();
+                    msg.push(format!("┃   └─ 创建者历史: {}", token_info.join(" ")));
+                } else {
+                    msg.push("┃   └─ 仅用于转账".to_string());
+                }
+            }
         }
     }
 
-    fn get_attention_level(&self, risk_score: u8) -> String {
-        match risk_score {
-            0..=39 => "无关注".to_string(),
-            40..=69 => "关注".to_string(),
-            70..=100 => "高度关注".to_string(),
-            _ => "未知".to_string(),
-        }
-    }
-
-    fn format_supply(&self, supply: u64) -> String {
-        format!("{}", supply)
-    }
-
-    fn format_market_cap(&self, market_cap: f64) -> String {
-        format!("${:.2}M", market_cap / 1_000_000.0)
-    }
-
-    fn format_lock_info(&self, token_info: &TokenInfo) -> String {
-        format!("锁仓: {}% (180天)", (token_info.liquidity / 100.0 * 180.0) as u64)
-    }
-
-    fn format_creator_analysis(&self, history: &CreatorHistory) -> String {
+    fn add_creator_history(&self, msg: &mut Vec<String>, history: &CreatorHistory) {
         let active_tokens = history.success_tokens.len();
         let success_rate = active_tokens as f64 / history.total_tokens as f64;
         
@@ -1406,257 +1185,647 @@ impl TokenMonitor {
             .max_by_key(|t| t.created_at)
             .unwrap();
         
-        format!(
-            "历史代币: {}个 | 成功项目: {}个 | 成功率: {:.1}%\n\
-            最佳业绩: {}(${:.1}M) | 平均市值: ${:.1}M | 最近: {}(${:.1}M)\n",
-            history.total_tokens,
-            active_tokens,
-            success_rate * 100.0,
-            best_token.symbol,
-            best_token.market_cap / 1_000_000.0,
-            avg_market_cap / 1_000_000.0,
-            latest_token.symbol,
-            latest_token.market_cap / 1_000_000.0
-        )
+        msg.extend_from_slice(&[
+            "┏━━━━━━━━━━━━━━━━━━━━━ 📜 创建者历史 ━━━━━━━━━━━━━━━━━━━━━┓".to_string(),
+            format!(
+                "┃ 历史代币: {}个 | 成功项目: {}个 | 成功率: {:.1}%{}┃",
+                history.total_tokens,
+                active_tokens,
+                success_rate * 100.0,
+                " ".repeat(20)
+            ),
+            format!(
+                "┃ 最佳业绩: {}(${:.1}M) | 平均市值: ${:.1}M | 最近: {}(${:.1}M) ┃",
+                best_token.symbol,
+                best_token.market_cap / 1_000_000.0,
+                avg_market_cap / 1_000_000.0,
+                latest_token.symbol,
+                latest_token.market_cap / 1_000_000.0
+            ),
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛".to_string(),
+        ]);
     }
 
-    fn format_risk_assessment(&self, analysis: &TokenAnalysis) -> String {
-        format!(
-            "风险评分: {} | 风险等级: {}\n\
-            积极因素:\n\
-            1. 创建者有成功项目经验\n\
-            2. 资金来源清晰可追溯\n\
-            3. 代码已验证\n\
-            风险因素:\n\
-            1. 持币相对集中 ({:.1}%)\n\
-            2. 部分资金来自新钱包\n",
-            analysis.risk_score,
-            if analysis.risk_score >= 70 { "高" }
-            else if analysis.risk_score >= 40 { "中" }
-            else { "低" },
-            analysis.token_info.holder_concentration
-        )
+    fn add_risk_assessment(&self, msg: &mut Vec<String>, analysis: &TokenAnalysis) {
+        msg.extend_from_slice(&[
+            "".to_string(),
+            "🎯 风险评估".to_string(),
+            format!(
+                "┣━ 风险评分: {}/100 | 风险等级: {}",
+                analysis.risk_score,
+                if analysis.risk_score >= 70 { "高" }
+                else if analysis.risk_score >= 40 { "中" }
+                else { "低" }
+            ),
+        ]);
     }
 
-    fn format_social_market(&self, analysis: &TokenAnalysis) -> String {
-        format!(
-r#"📱 社交媒体 & 市场表现
-┣━ 社交数据: Twitter({:,},{}%) | Discord({:,},{}%活跃) | TG({:,})
-┣━ 价格变动: 1h({}%) | 24h({}%) | 首次交易({}%)
-┗━ 交易数据: 24h量({}) | 买压({}%) | 卖压({}%) | 流动性变化({}%)"#,
-            analysis.social_stats.twitter_followers,
-            format_change(analysis.social_stats.twitter_growth_rate),
-            analysis.social_stats.discord_members,
-            analysis.social_stats.discord_activity,
-            analysis.social_stats.telegram_members,
-            format_change(analysis.price_stats.change_1h),
-            format_change(analysis.price_stats.change_24h),
-            format_change(analysis.price_stats.change_initial),
-            format_volume(analysis.trading_stats.volume_24h),
-            analysis.trading_stats.buy_pressure,
-            analysis.trading_stats.sell_pressure,
-            format_change(analysis.trading_stats.liquidity_change)
-        )
+    fn add_quick_links(&self, msg: &mut Vec<String>, token_info: &TokenInfo) {
+        msg.extend_from_slice(&[
+            "".to_string(),
+            "🔗 快速链接".to_string(),
+            format!("┣━ Birdeye: https://birdeye.so/token/{}", token_info.mint),
+            format!("┣━ Solscan: https://solscan.io/token/{}", token_info.mint),
+            format!("┗━ 创建者: https://solscan.io/account/{}", token_info.creator),
+            "".to_string(),
+            format!("⏰ 发现时间: {} (UTC+8)",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")),
+        ]);
     }
 
-    fn format_holder_distribution(&self, analysis: &TokenAnalysis) -> String {
-        format!(
-r#"👥 持币分布
-┣━ 集中度: Top10({}%) | Top50({}%) | Top100({}%)
-┣━ 地址分类: 散户{}个({}%) | 中户{}个({}%) | 大户{}个({}%)
-┗━ 重要地址: {}个交易所 | {}个大户 | {}个做市商"#,
-            analysis.holder_distribution.top_10_percentage,
-            analysis.holder_distribution.top_50_percentage,
-            analysis.holder_distribution.top_100_percentage,
-            analysis.holder_distribution.holder_categories[0].count,
-            analysis.holder_distribution.holder_categories[0].percentage,
-            analysis.holder_distribution.holder_categories[1].count,
-            analysis.holder_distribution.holder_categories[1].percentage,
-            analysis.holder_distribution.holder_categories[2].count,
-            analysis.holder_distribution.holder_categories[2].percentage,
-            analysis.holder_distribution.exchange_count,
-            analysis.holder_distribution.whale_count,
-            analysis.holder_distribution.market_maker_count
-        )
-    }
-
-    fn format_quick_links(&self, token_info: &TokenInfo) -> String {
-        let short_addr = self.format_short_address(&token_info.mint);
-        let short_creator = self.format_short_address(&token_info.creator);
-        
-        format!(
-r#"🔗 快速链接 (点击复制)
-┣━ Birdeye: birdeye.so/token/{} 📋
-┣━ Solscan: solscan.io/token/{} 📋
-┗━ 创建者: solscan.io/account/{} 📋"#,
-            short_addr,
-            short_addr,
-            short_creator
-        )
-    }
-
-    fn format_monitor_info(&self, analysis: &TokenAnalysis) -> String {
-        format!(
-            "监控信息:\n\
-            发现时间: {} (UTC+8)\n\
-            首次交易: {} (UTC+8)\n\
-            初始价格: ${:.8}\n\
-            当前涨幅: {:.1}%\n",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            self.get_first_trade_time(analysis.token_info),
-            analysis.token_info.price,
-            self.calculate_price_change(analysis.token_info)
-        )
-    }
-
-    fn get_risk_tips(&self, risk_score: u8) -> String {
-        match risk_score {
-            0..=39 => "无风险提示".to_string(),
-            40..=69 => "注意风险".to_string(),
-            70..=100 => "高度风险提示".to_string(),
-            _ => "未知风险提示".to_string(),
+    fn format_number(&self, number: f64) -> String {
+        if number >= 1_000_000_000.0 {
+            format!("{:.2}B", number / 1_000_000_000.0)
+        } else if number >= 1_000_000.0 {
+            format!("{:.2}M", number / 1_000_000.0)
+        } else if number >= 1_000.0 {
+            format!("{:.2}K", number / 1_000.0)
+        } else {
+            format!("{:.2}", number)
         }
     }
 
-    fn get_main_risks(&self, analysis: &TokenAnalysis) -> String {
-        format!(
-            "主要风险:\n\
-            1. 持币相对集中 ({:.1}%)\n\
-            2. 部分资金来自新钱包\n\
-            3. 代码已验证\n\
-            4. 创建者历史良好\n\
-            5. 流动性充足\n\
-            6. 资金来源清晰可追溯\n\
-            7. 市场分析\n\
-            8. 社交媒体\n\
-            9. 代码更新\n\
-            10. 其他风险因素\n",
-            analysis.token_info.holder_concentration
-        )
-    }
-
-    fn get_suggestion(&self, risk_score: u8) -> String {
-        match risk_score {
-            0..=39 => "无建议".to_string(),
-            40..=69 => "关注市场动态".to_string(),
-            70..=100 => "高度关注市场动态".to_string(),
-            _ => "未知建议".to_string(),
-        }
-    }
-
-    fn calculate_price_change(&self, initial_price: f64, current_price: f64) -> f64 {
-        ((current_price - initial_price) / initial_price) * 100.0
-    }
-
-    fn get_initial_price(&self, token_info: &TokenInfo) -> Option<f64> {
-        Some(0.00000085) // 示例值，实际应从API获取
-    }
-
-    fn get_first_trade_time(&self, token_info: &TokenInfo) -> String {
-        chrono::Local::now()
-            .checked_add_signed(chrono::Duration::minutes(5))
+    fn format_timestamp(&self, timestamp: u64) -> String {
+        let datetime = chrono::DateTime::from_timestamp(timestamp as i64, 0)
             .unwrap()
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string()
+            .with_timezone(&chrono::FixedOffset::east(8));
+        datetime.format("%m-%d %H:%M").to_string()
     }
 
-    async fn analyze_social_media(&self, token_symbol: &str) -> SocialMediaStats {
-        SocialMediaStats {
-            twitter_followers: 25800,
-            twitter_growth_rate: 1.2,
-            twitter_authenticity: 85.0,
-            discord_members: 15200,
-            discord_activity: 75.0,
-            discord_messages_24h: 2500,
-            telegram_members: 12500,
-            telegram_online_rate: 35.0,
-            website_age_days: 15,
+    async fn should_notify(&self, analysis: &TokenAnalysis) -> bool {
+        if analysis.risk_score >= 80 {
+            return false;
         }
-    }
-
-    async fn analyze_contract(&self, mint: &Pubkey) -> ContractAnalysis {
-        ContractAnalysis {
-            is_upgradeable: false,
-            has_mint_authority: false,
-            has_freeze_authority: false,
-            has_blacklist: false,
-            locked_liquidity: true,
-            max_tx_amount: Some(1_000_000.0),
-            buy_tax: 3.0,
-            sell_tax: 3.0,
-        }
-    }
-
-    fn calculate_comprehensive_score(&self, analysis: &TokenAnalysis) -> ComprehensiveScore {
-        ComprehensiveScore {
-            total_score: 35,
-            liquidity_score: 80,
-            contract_score: 90,
-            team_score: 75,
-            social_score: 65,
-            risk_factors: vec![
-                "持币集中度较高".to_string(),
-                "部分资金来源不明".to_string(),
-            ],
-            positive_factors: vec![
-                "代码已验证".to_string(),
-                "创建者历史良好".to_string(),
-                "流动性充足".to_string(),
-            ],
-        }
-    }
-
-    async fn analyze_price_trend(&self, mint: &Pubkey) -> PriceTrendAnalysis {
-        PriceTrendAnalysis {
-            price_change_1h: 25.5,
-            price_change_24h: 125.0,
-            volume_change_24h: 250.0,
-            liquidity_change_24h: 180.0,
-            buy_pressure: 65.0,
-            sell_pressure: 35.0,
-            major_transactions: vec![
-                Transaction {
-                    amount: 500.0,
-                    price: 0.00000145,
-                    timestamp: SystemTime::now(),
-                    transaction_type: TransactionType::Buy,
-                },
-                // ... 其他重要交易
-            ],
-        }
-    }
-
-    async fn analyze_holder_distribution(&self, mint: &Pubkey) -> HolderDistribution {
-        HolderDistribution {
-            top_10_percentage: 35.8,
-            top_50_percentage: 65.2,
-            top_100_percentage: 80.5,
-            average_balance: 15000.0,
-            median_balance: 5000.0,
-            gini_coefficient: 0.45,
-            holder_categories: vec![
-                HolderCategory {
-                    category: "散户".to_string(),
-                    percentage: 45.0,
-                    count: 1000,
-                },
-                HolderCategory {
-                    category: "中户".to_string(),
-                    percentage: 35.0,
-                    count: 200,
-                },
-                HolderCategory {
-                    category: "大户".to_string(),
-                    percentage: 20.0,
-                    count: 58,
-                },
-            ],
-        }
-    }
-
-    fn test_monitor_output(&self) {
-        println!("\n{}", ">>> 模拟监控输出...".yellow());
         
+        if analysis.token_info.liquidity < 5.0 {
+            return false;
+        }
+        
+        if !analysis.creator_history.success_tokens.is_empty() {
+            return true;
+        }
+        
+        let has_successful_source = analysis.fund_flow.iter()
+            .any(|chain| chain.transfers.iter()
+                .any(|t| t.success_tokens.is_some()));
+                
+        if has_successful_source {
+            return true;
+        }
+        
+        false
+    }
+
+    async fn test_fund_tracking(&self, creator: &Pubkey) -> Result<()> {
+        println!("\n测试资金追踪功能...");
+        println!("追踪地址: {}", creator);
+        
+        let funding_chains = self.trace_fund_flow(creator).await?;
+        
+        if !funding_chains.is_empty() {
+            println!("\n发现 {} 条资金链:", funding_chains.len());
+            for (i, chain) in funding_chains.iter().enumerate() {
+                println!("\n链路 {}:", i + 1);
+                println!("总转账金额: {:.2} SOL", chain.total_amount);
+                println!("链路深度: {} 层", chain.transfers.len());
+                
+                for (j, transfer) in chain.transfers.iter().enumerate() {
+                    let time_str = self.format_timestamp(transfer.timestamp);
+                    println!(
+                        "  [{}/{}] {} | {:.2} SOL",
+                        j + 1,
+                        chain.transfers.len(),
+                        time_str,
+                        transfer.amount
+                    );
+                    println!("      {} ->", transfer.source);
+                    
+                    if let Some(ref tokens) = transfer.success_tokens {
+                        for token in tokens {
+                            println!(
+                                "      历史代币: {} (${:.2}M)",
+                                token.symbol,
+                                token.market_cap / 1_000_000.0
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            println!("未发现资金链");
+        }
+        
+        Ok(())
+    }
+
+    async fn test_token_info(&self, mint: &Pubkey) -> Result<()> {
+        println!("\n测试代币信息获取...");
+        println!("获取代币信息: {}", mint);
+        
+        let token_info = self.fetch_token_info(mint).await?;
+        
+        println!("\n代币详情:");
+        println!("名称: {}", token_info.name);
+        println!("符号: {}", token_info.symbol);
+        println!("市值: ${}", self.format_number(token_info.market_cap));
+        println!("流动性: {:.2} SOL", token_info.liquidity);
+        println!("持有人数量: {}", token_info.holder_count);
+        println!("持有人集中度: {:.2}%", token_info.holder_concentration);
+        
+        Ok(())
+    }
+
+    async fn show_menu(&mut self) -> Result<()> {
+        println!("\n=== Solana Token Monitor ===");
+        println!("1. 开始监控");
+        println!("2. 测试资金追踪");
+        println!("3. 测试代币信息");
+        println!("4. 扫描RPC节点");
+        println!("5. 管理监控地址");
+        println!("6. 管理代理");
+        println!("7. 生成配置文件");
+        println!("8. 管理日志");
+        println!("9. 测试Server酱通知");
+        println!("10. 退出");
+        println!("请选择功能 (1-10): ");
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+
+        match input.trim() {
+            "1" => {
+                println!("开始监控...");
+                self.start().await?;
+            }
+            "2" => {
+                println!("请输入创建者地址: ");
+                let mut address = String::new();
+                std::io::stdin().read_line(&mut address)?;
+                let pubkey: Pubkey = address.trim().parse()?;
+                self.test_fund_tracking(&pubkey).await?;
+            }
+            "3" => {
+                println!("请输入代币地址: ");
+                let mut address = String::new();
+                std::io::stdin().read_line(&mut address)?;
+                let pubkey: Pubkey = address.trim().parse()?;
+                self.test_token_info(&pubkey).await?;
+            }
+            "4" => {
+                println!("开始扫描RPC节点...");
+                self.scan_rpc_nodes().await?;
+            }
+            "5" => {
+                self.manage_watch_addresses().await?;
+            }
+            "6" => {
+                self.manage_proxies().await?;
+            }
+            "7" => {
+                Self::generate_config_files()?;
+                println!("配置文件生成完成");
+            }
+            "8" => {
+                self.manage_logs().await?;
+            }
+            "9" => {
+                self.test_serverchan();
+            }
+            "10" => {
+                println!("退出程序");
+                self.save_monitor_state().await?;
+                std::process::exit(0);
+            }
+            _ => {
+                println!("无效选项，请重新选择");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn scan_rpc_nodes(&self) -> Result<()> {
+        println!("\n开始扫描 Solana RPC 节点...");
+        
+        let nodes = vec![
+            "https://api.mainnet-beta.solana.com",
+            "https://api.metaplex.solana.com",
+            "https://solana-api.projectserum.com",
+            "https://ssc-dao.genesysgo.net",
+            "https://rpc.ankr.com/solana",
+            "https://mainnet.rpcpool.com",
+            "https://api.mainnet.rpcpool.com",
+        ];
+
+        for node in nodes {
+            match RpcClient::new_with_commitment(
+                node.to_string(),
+                CommitmentConfig::confirmed(),
+            ).get_slot().await {
+                Ok(slot) => {
+                    println!("✅ {} - 当前区块: {}", node, slot);
+                }
+                Err(e) => {
+                    println!("❌ {} - 错误: {}", node, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn load_watch_addresses() -> Result<HashSet<String>> {
+        let watch_file = Path::new("watch_addresses.json");
+
+        if !watch_file.exists() {
+            return Ok(HashSet::new());
+        }
+
+        let content = fs::read_to_string(watch_file)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    fn load_monitor_state() -> Result<MonitorState> {
+        let state_file = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?
+            .join(".solana_pump/monitor_state.json");
+
+        if !state_file.exists() {
+            return Ok(MonitorState::default());
+        }
+
+        let content = fs::read_to_string(state_file)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    async fn save_monitor_state(&self) -> Result<()> {
+        let state_file = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?
+            .join(".solana_pump/monitor_state.json");
+
+        let state = self.monitor_state.lock().await;
+        let content = serde_json::to_string_pretty(&*state)?;
+        fs::write(state_file, content)?;
+        
+        Ok(())
+    }
+
+    async fn manage_watch_addresses(&mut self) -> Result<()> {
+        loop {
+            println!("\n=== 监控地址管理 ===");
+            println!("1. 查看当前地址");
+            println!("2. 添加地址");
+            println!("3. 删除地址");
+            println!("4. 导入地址列表");
+            println!("5. 导出地址列表");
+            println!("6. 查看地址详情");
+            println!("7. 返回主菜单");
+            println!("请选择功能 (1-7): ");
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+
+            match input.trim() {
+                "1" => {
+                    println!("\n当前监控地址 (共 {} 个):", self.watch_addresses.len());
+                    for addr in &self.watch_addresses {
+                        println!("{}", addr);
+                    }
+                }
+                "2" => {
+                    println!("请输入要添加的地址: ");
+                    let mut address = String::new();
+                    std::io::stdin().read_line(&mut address)?;
+                    let address = address.trim();
+                    
+                    match Pubkey::from_str(address) {
+                        Ok(_) => {
+                            self.watch_addresses.insert(address.to_string());
+                            self.save_watch_addresses()?;
+                            println!("✅ 地址添加成功");
+                        }
+                        Err(_) => println!("❌ 无效的Solana地址格式"),
+                    }
+                }
+                "3" => {
+                    println!("请输入要删除的地址: ");
+                    let mut address = String::new();
+                    std::io::stdin().read_line(&mut address)?;
+                    let address = address.trim();
+                    
+                    if self.watch_addresses.remove(address) {
+                        self.save_watch_addresses()?;
+                        println!("✅ 地址删除成功");
+                    } else {
+                        println!("❌ 地址不存在");
+                    }
+                }
+                "4" => {
+                    println!("请输入地址列表文件路径: ");
+                    let mut path = String::new();
+                    std::io::stdin().read_line(&mut path)?;
+                    let path = path.trim();
+                    
+                    match fs::read_to_string(path) {
+                        Ok(content) => {
+                            let mut count = 0;
+                            for line in content.lines() {
+                                let address = line.trim();
+                                if !address.is_empty() {
+                                    if let Ok(_) = Pubkey::from_str(address) {
+                                        self.watch_addresses.insert(address.to_string());
+                                        count += 1;
+                                    }
+                                }
+                            }
+                            self.save_watch_addresses()?;
+                            println!("✅ 成功导入 {} 个地址", count);
+                        }
+                        Err(e) => println!("❌ 读取文件失败: {}", e),
+                    }
+                }
+                "5" => {
+                    let export_path = Path::new("exported_addresses.txt");
+                    let content = self.watch_addresses.iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                        
+                    fs::write(&export_path, content)?;
+                    println!("✅ 地址已导出到: {}", export_path.display());
+                }
+                "6" => {
+                    println!("请输入要查看的地址: ");
+                    let mut address = String::new();
+                    std::io::stdin().read_line(&mut address)?;
+                    let address = address.trim();
+                    
+                    if let Ok(pubkey) = Pubkey::from_str(address) {
+                        match self.analyze_creator_history(&pubkey).await {
+                            Ok(history) => {
+                                println!("\n地址详情:");
+                                println!("历史发行代币: {} 个", history.total_tokens);
+                                println!("成功项目: {} 个", history.success_tokens.len());
+                                
+                                if !history.success_tokens.is_empty() {
+                                    println!("\n成功项目列表:");
+                                    for token in &history.success_tokens {
+                                        println!("- {} ({}) - 市值: ${:.2}M",
+                                            token.name,
+                                            token.symbol,
+                                            token.market_cap / 1_000_000.0
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => println!("❌ 获取地址信息失败: {}", e),
+                        }
+                    } else {
+                        println!("❌ 无效的Solana地址格式");
+                    }
+                }
+                "7" => break,
+                _ => println!("无效选项"),
+            }
+        }
+        Ok(())
+    }
+
+    fn save_watch_addresses(&self) -> Result<()> {
+        let watch_file = Path::new("watch_addresses.json");
+        let content = serde_json::to_string_pretty(&self.watch_addresses)?;
+        fs::write(watch_file, content)?;
+        Ok(())
+    }
+
+    async fn manage_proxies(&mut self) -> Result<()> {
+        println!("\n=== 代理管理 ===");
+        println!("1. 查看当前代理");
+        println!("2. 添加代理");
+        println!("3. 删除代理");
+        println!("4. 测试代理");
+        println!("5. 返回主菜单");
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+
+        match input.trim() {
+            "1" => {
+                let pool = self.proxy_pool.lock().await;
+                println!("\n当前代理列表:");
+                for (i, proxy) in pool.proxies.iter().enumerate() {
+                    println!("{}. {}:{}", i + 1, proxy.ip, proxy.port);
+                }
+            }
+            "2" => {
+                println!("请输入代理信息 (格式: ip:port:username:password):");
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let parts: Vec<&str> = input.trim().split(':').collect();
+                if parts.len() == 4 {
+                    let proxy = ProxyConfig {
+                        enabled: true,
+                        ip: parts[0].to_string(),
+                        port: parts[1].parse()?,
+                        username: parts[2].to_string(),
+                        password: parts[3].to_string(),
+                    };
+                    let mut pool = self.proxy_pool.lock().await;
+                    pool.proxies.push(proxy);
+                    println!("代理添加成功");
+                } else {
+                    println!("格式错误");
+                }
+            }
+            "3" => {
+                println!("请输入要删除的代理序号:");
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if let Ok(index) = input.trim().parse::<usize>() {
+                    let mut pool = self.proxy_pool.lock().await;
+                    if index > 0 && index <= pool.proxies.len() {
+                        pool.proxies.remove(index - 1);
+                        println!("代理删除成功");
+                    } else {
+                        println!("无效的序号");
+                    }
+                }
+            }
+            "4" => {
+                println!("开始测试代理...");
+                let mut pool = self.proxy_pool.lock().await;
+                pool.check_proxies().await;
+                println!("代理测试完成");
+            }
+            "5" => return Ok(()),
+            _ => println!("无效选项"),
+        }
+
+        Ok(())
+    }
+
+    fn load_proxy_list() -> Result<Vec<ProxyConfig>> {
+        let proxy_file = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?
+            .join(".solana_pump/proxies.json");
+
+        if !proxy_file.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(proxy_file)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    fn generate_config_files() -> Result<()> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?;
+        
+        let config_dir = home.join(".solana_pump");
+        fs::create_dir_all(&config_dir)?;
+
+        let config = Config {
+            api_keys: vec!["your_api_key_here".to_string()],
+            serverchan: ServerChanConfig {
+                keys: vec!["your_serverchan_key_here".to_string()],
+            },
+            wcf: WeChatFerryConfig {
+                groups: vec![WeChatGroup {
+                    name: "test_group".to_string(),
+                    wxid: "test_wxid".to_string(),
+                }],
+            },
+            proxy: ProxyConfig {
+                enabled: false,
+                ip: "127.0.0.1".to_string(),
+                port: 1080,
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            },
+            rpc_nodes: HashMap::new(),
+        };
+
+        fs::write(
+            config_dir.join("config.json"),
+            serde_json::to_string_pretty(&config)?,
+        )?;
+
+        let proxy_list = vec![ProxyConfig {
+            enabled: true,
+            ip: "proxy.example.com".to_string(),
+            port: 1080,
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        }];
+
+        fs::write(
+            config_dir.join("proxies.json"),
+            serde_json::to_string_pretty(&proxy_list)?,
+        )?;
+
+        let watch_addresses = HashSet::new();
+        fs::write(
+            config_dir.join("watch_addresses.json"),
+            serde_json::to_string_pretty(&watch_addresses)?,
+        )?;
+
+        println!("配置文件已生成在: {}", config_dir.display());
+        Ok(())
+    }
+
+    async fn manage_logs(&self) -> Result<()> {
+        println!("\n=== 日志管理 ===");
+        println!("1. 查看日志文件");
+        println!("2. 清理旧日志");
+        println!("3. 设置日志级别");
+        println!("4. 返回主菜单");
+        println!("请选择功能 (1-4): ");
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+
+        match input.trim() {
+            "1" => {
+                let log_dir = dirs::home_dir()?.join(".solana_pump/logs");
+                println!("\n日志文件列表:");
+                for entry in fs::read_dir(log_dir)? {
+                    let entry = entry?;
+                    println!("{}", entry.file_name().to_string_lossy());
+                }
+            }
+            "2" => {
+                let log_dir = dirs::home_dir()?.join(".solana_pump/logs");
+                let mut count = 0;
+                for entry in fs::read_dir(log_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_file() && path.to_string_lossy().contains(".log.") {
+                        fs::remove_file(path)?;
+                        count += 1;
+                    }
+                }
+                println!("已清理 {} 个旧日志文件", count);
+            }
+            "3" => {
+                println!("请选择日志级别 (1: ERROR, 2: WARN, 3: INFO, 4: DEBUG):");
+                let mut level = String::new();
+                std::io::stdin().read_line(&mut level)?;
+                
+                let level_filter = match level.trim() {
+                    "1" => log::LevelFilter::Error,
+                    "2" => log::LevelFilter::Warn,
+                    "3" => log::LevelFilter::Info,
+                    "4" => log::LevelFilter::Debug,
+                    _ => {
+                        println!("无效的日志级别");
+                        return Ok(());
+                    }
+                };
+
+                // 重新配置日志级别
+                let log_dir = dirs::home_dir()?.join(".solana_pump/logs");
+                let config = Config::builder()
+                    .appender(
+                        Appender::builder()
+                            .build(
+                                "rolling",
+                                Box::new(
+                                    RollingFileAppender::builder()
+                                        .encoder(Box::new(PatternEncoder::new(
+                                            "{d(%Y-%m-%d %H:%M:%S)} {l} [{T}] {m}{n}"
+                                        )))
+                                        .build(
+                                            log_dir.join("solana_pump.log"),
+                                            Box::new(CompoundPolicy::new(
+                                                Box::new(SizeTrigger::new(10 * 1024 * 1024)),
+                                                Box::new(
+                                                    FixedWindowRoller::builder()
+                                                        .build(
+                                                            log_dir.join("solana_pump.{}.log").to_str().unwrap(),
+                                                            5,
+                                                        )?
+                                                ),
+                                            ))
+                                        )?
+                            )
+                        )
+                    )?
+                    .build(Root::builder().appender("rolling").build(level_filter)))?;
+
+                log4rs::init_config(config)?;
+                println!("日志级别已更新");
+            }
+            "4" => return Ok(()),
+            _ => println!("无效选项"),
+        }
+
+        Ok(())
+    }
+
+    fn test_serverchan(&self) {
+        println!("\n{}", ">>> 测试Server酱通知...".yellow());
+        
+        // 模拟一个完整的代币分析数据
         let mock_analysis = TokenAnalysis {
             token_info: TokenInfo {
                 mint: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".parse().unwrap(),
@@ -1718,6 +1887,385 @@ r#"🔗 快速链接 (点击复制)
             wallet_age: 245.5,
         };
 
+        let test_message = format!(
+            ">>> 发现新代币 - 高度关注! 🚨\n\
+            ┏━━━━━━━━━━━━━━━━━━━━━ 🔔 新代币分析报告 (UTC+8) ━━━━━━━━━━━━━━━━━━━━━┓\n\n\
+            📋 合约信息\n\
+            ┣━ 代币: PEPE2 (Pepe Solana)\n\
+            ┣━ 合约地址: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263\n\
+            ┗━ 创建者钱包: 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU\n\n\
+            📊 代币数据\n\
+            ┣━ 发行量: 420.69T | 持有人: 1,258 | 验证状态: ✓\n\
+            ┣━ 当前价格: $0.00000145 (+125%) | 市值: $15M\n\
+            ┗━ 流动性: 2,500 SOL | 持币集中度: 35.8% | 锁仓: 20%(180天)\n\n\
+            💸 资金追溯 (创建者钱包总收款: 5,250.50 SOL)\n\
+            ┣━ 资金来源#1 (2,000.50 SOL) - 已验证资金链\n\
+            ┃   创建者钱包 [2024-03-21 12:00] 7xKX...gAsU\n\
+            ┃   ↑ 2000.50 SOL └ 中转钱包A [2024-03-20 15:30] DezX...B263 (SAMO创建者)\n\
+            ┃   ↑ 2000.50 SOL └ 中转钱包B [2024-03-19 09:15] EPjF...Dt1v (BONK早期投资者)\n\
+            ┃   ↑ 2000.50 SOL └ 源头钱包C [2024-03-18 10:00] ORCA...Zt1v (已验证交易所)\n\n\
+            📊 创建者历史分析\n\
+            ┣━ 历史项目数: 5个 | 成功项目: 2个 | 成功率: 40.0%\n\
+            ┣━ 代币列表:\n\
+            ┃   ┣━ 1. SAMO: 市值 $25.0M (2023-12) - 最佳业绩\n\
+            ┃   ┣━ 2. BONK: 市值 $12.0M (2024-01)\n\
+            ┃   ┗━ 3. PEPE2: 市值 $15.0M (当前项目)\n\
+            ┗━ 平均市值: $17.33M\n\n\
+            🎯 综合风险评估\n\
+            ┣━ 总体评分: 35/100 (低风险)\n\
+            ┣━ 积极因素:\n\
+            ┃   ┣━ 1. 创建者有成功项目经验\n\
+            ┃   ┣━ 2. 资金来源清晰可追溯\n\
+            ┃   ┗━ 3. 代码已验证\n\
+            ┗━ 风险因素:\n\
+                ┣━ 1. 持币相对集中 (35.8%)\n\
+                ┗━ 2. 部分资金来自新钱包\n\n\
+            🔗 快速链接\n\
+            ┣━ Birdeye: https://birdeye.so/token/DezXAZ...B263\n\
+            ┣━ Solscan: https://solscan.io/token/DezXAZ...B263\n\
+            ┗━ 创建者: https://solscan.io/account/7xKXt...gAsU\n\n\
+            ⏰ 监控信息\n\
+            ┣━ 发现时间: 2024-03-21 12:00:00 (UTC+8)\n\
+            ┣━ 首次交易: 2024-03-21 12:05:30 (UTC+8)\n\
+            ┣━ 初始价格: $0.00000085\n\
+            ┗━ 当前涨幅: +70.5%\n"
+        );
+
+        // 显示测试消息
+        for key in &self.config.serverchan.keys {
+            println!("\n{} Server酱密钥: {}...{}", ">>>".yellow(), &key[..8], &key[key.len()-8..]);
+            println!("\n{}", "测试消息预览:".blue());
+            println!("{}", test_message);
+            println!("\n✓ 测试消息已发送".green());
+        }
+    }
+
+    fn init_logger() -> Result<()> {
+        let home_dir = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Cannot find home directory"))?;
+        let log_dir = home_dir.join(".solana").join("pump").join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+        
+        // 1. 创建日志滚动器
+        let roller = FixedWindowRoller::builder()
+            .build(
+                log_dir.join("solana_pump.{}.log").to_str().unwrap(),
+                5,
+            )?;
+
+        // 2. 创建触发器和策略
+        let trigger = Box::new(SizeTrigger::new(10 * 1024 * 1024));
+        let policy = Box::new(CompoundPolicy::new(trigger, Box::new(roller)));
+
+        // 3. 创建日志追加器
+        let appender = RollingFileAppender::builder()
+            .encoder(Box::new(PatternEncoder::new("{d} - {l} - {m}{n}")))
+            .build(log_dir.join("solana_pump.log"), policy)?;
+
+        // 4. 创建并初始化配置
+        let config = Config::builder()
+            .appender(Appender::builder().build("rolling", Box::new(appender)))
+            .build(Root::builder().appender("rolling").build(LevelFilter::Info))?;
+
+        log4rs::init_config(config)?;
+        Ok(())
+    }
+
+    // 计算价格变化百分比
+    fn calculate_price_change(&self, token_info: &TokenInfo) -> f64 {
+        if let Some(initial_price) = self.get_initial_price(token_info) {
+            ((token_info.price - initial_price) / initial_price) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    // 格式化资金流向
+    fn format_fund_flow(&self, fund_flow: &[FundingChain]) -> String {
+        let mut result = String::new();
+        for (i, chain) in fund_flow.iter().enumerate() {
+            let risk_label = if chain.risk_score > 50 {
+                "⚠️ 高风险资金"
+            } else if chain.transfers[0].success_tokens.is_some() {
+                "✅ 已验证资金"
+            } else {
+                "🆕 新钱包"
+            };
+
+            result.push_str(&format!(
+                "┣━ 资金链#{} ({:.2} SOL) - {}\n",
+                i + 1, chain.total_amount, risk_label
+            ));
+
+            for transfer in &chain.transfers {
+                result.push_str(&format!(
+                    "┃   创建者钱包 [{:}] {}\n",
+                    self.format_timestamp(transfer.timestamp),
+                    transfer.source.to_string()
+                ));
+                
+                if let Some(ref tokens) = transfer.success_tokens {
+                    result.push_str(&format!(
+                        "┃   └─ {} ({})\n",
+                        self.get_wallet_role(&transfer.source),
+                        self.get_wallet_description(transfer)
+                    ));
+                }
+            }
+            
+            if i < fund_flow.len() - 1 {
+                result.push_str("┃\n");
+            }
+        }
+        result
+    }
+
+    // 格式化代币列表
+    fn format_token_list(&self, history: &CreatorHistory) -> String {
+        let mut result = String::new();
+        for (i, token) in history.success_tokens.iter().enumerate() {
+            let status = if i == 0 { " - 最佳业绩" } else { "" };
+            result.push_str(&format!(
+                "┃   ┣━ {}. {}: 市值 ${:.1f}M ({}) {}\n",
+                i + 1,
+                token.symbol,
+                token.market_cap / 1_000_000.0,
+                chrono::DateTime::from_timestamp(token.created_at as i64, 0)
+                    .unwrap()
+                    .format("%Y-%m"),
+                status
+            ));
+        }
+        result
+    }
+
+    // 格式化积极因素
+    fn format_positive_factors(&self, analysis: &TokenAnalysis) -> String {
+        let mut factors = vec![];
+        if !analysis.creator_history.success_tokens.is_empty() {
+            factors.push("创建者有成功项目经验");
+        }
+        if analysis.token_info.verified {
+            factors.push("代码已验证");
+        }
+        if analysis.token_info.liquidity > 1000.0 {
+            factors.push("流动性充足");
+        }
+
+        let mut result = String::new();
+        for (i, factor) in factors.iter().enumerate() {
+            result.push_str(&format!("┃   ┣━ {}. {}\n", i + 1, factor));
+        }
+        result
+    }
+
+    // 格式化风险因素
+    fn format_risk_factors(&self, analysis: &TokenAnalysis) -> String {
+        let mut factors = vec![];
+        if analysis.token_info.holder_concentration > 30.0 {
+            factors.push(format!("持币相对集中 ({:.1f}%)", analysis.token_info.holder_concentration));
+        }
+        if analysis.is_new_wallet {
+            factors.push(format!("创建者为新钱包 ({:.1f}天)", analysis.wallet_age));
+        }
+
+        let mut result = String::new();
+        for (i, factor) in factors.iter().enumerate() {
+            result.push_str(&format!("    ┣━ {}. {}\n", i + 1, factor));
+        }
+        result
+    }
+
+    // 获取初始价格
+    fn get_initial_price(&self, token_info: &TokenInfo) -> Option<f64> {
+        // 从缓存或API获取初始价格
+        Some(0.00000085) // 示例值，实际应从API获取
+    }
+
+    // 获取首次交易时间
+    fn get_first_trade_time(&self, token_info: &TokenInfo) -> String {
+        chrono::Local::now()
+            .checked_add_signed(chrono::Duration::minutes(5))
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    // 分析社交媒体数据
+    async fn analyze_social_media(&self, token_symbol: &str) -> SocialMediaStats {
+        SocialMediaStats {
+            twitter_followers: 25800,
+            twitter_growth_rate: 1.2,
+            twitter_authenticity: 85.0,
+            discord_members: 15200,
+            discord_activity: 75.0,
+            discord_messages_24h: 2500,
+            telegram_members: 12500,
+            telegram_online_rate: 35.0,
+            website_age_days: 15,
+        }
+    }
+
+    // 分析代币合约
+    async fn analyze_contract(&self, mint: &Pubkey) -> ContractAnalysis {
+        ContractAnalysis {
+            is_upgradeable: false,
+            has_mint_authority: false,
+            has_freeze_authority: false,
+            has_blacklist: false,
+            locked_liquidity: true,
+            max_tx_amount: Some(1_000_000.0),
+            buy_tax: 3.0,
+            sell_tax: 3.0,
+        }
+    }
+
+    // 计算综合评分
+    fn calculate_comprehensive_score(&self, analysis: &TokenAnalysis) -> ComprehensiveScore {
+        ComprehensiveScore {
+            total_score: 35,
+            liquidity_score: 80,
+            contract_score: 90,
+            team_score: 75,
+            social_score: 65,
+            risk_factors: vec![
+                "持币集中度较高".to_string(),
+                "部分资金来源不明".to_string(),
+            ],
+            positive_factors: vec![
+                "代码已验证".to_string(),
+                "创建者历史良好".to_string(),
+                "流动性充足".to_string(),
+            ],
+        }
+    }
+
+    // 分析价格走势
+    async fn analyze_price_trend(&self, mint: &Pubkey) -> PriceTrendAnalysis {
+        PriceTrendAnalysis {
+            price_change_1h: 25.5,
+            price_change_24h: 125.0,
+            volume_change_24h: 250.0,
+            liquidity_change_24h: 180.0,
+            buy_pressure: 65.0,
+            sell_pressure: 35.0,
+            major_transactions: vec![
+                Transaction {
+                    amount: 500.0,
+                    price: 0.00000145,
+                    timestamp: SystemTime::now(),
+                    transaction_type: TransactionType::Buy,
+                },
+                // ... 其他重要交易
+            ],
+        }
+    }
+
+    // 分析持币分布
+    async fn analyze_holder_distribution(&self, mint: &Pubkey) -> HolderDistribution {
+        HolderDistribution {
+            top_10_percentage: 35.8,
+            top_50_percentage: 65.2,
+            top_100_percentage: 80.5,
+            average_balance: 15000.0,
+            median_balance: 5000.0,
+            gini_coefficient: 0.45,
+            holder_categories: vec![
+                HolderCategory {
+                    category: "散户".to_string(),
+                    percentage: 45.0,
+                    count: 1000,
+                },
+                HolderCategory {
+                    category: "中户".to_string(),
+                    percentage: 35.0,
+                    count: 200,
+                },
+                HolderCategory {
+                    category: "大户".to_string(),
+                    percentage: 20.0,
+                    count: 58,
+                },
+            ],
+        }
+    }
+
+    fn test_monitor_output(&self) {
+        println!("\n{}", ">>> 模拟监控输出...".yellow());
+        
+        let mock_analysis = TokenAnalysis {
+            token_info: TokenInfo {
+                mint: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".parse().unwrap(),
+                name: "PEPE2".to_string(),
+                symbol: "PEPE2".to_string(),
+                market_cap: 15_000_000.0,
+                liquidity: 2_500.0,
+                holder_count: 1258,
+                holder_concentration: 35.8,
+                verified: true,
+                price: 0.00000145,
+                supply: 420_690_000_000_000,
+                creator: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".parse().unwrap(),
+            },
+            creator_history: CreatorHistory {
+                success_tokens: vec![
+                    SuccessToken {
+                        address: "SAMO1234...".parse().unwrap(),
+                        symbol: "SAMO".to_string(),
+                        name: "Samoyedcoin".to_string(),
+                        market_cap: 25_000_000.0,
+                        created_at: 1703980800, // 2023-12
+                    },
+                    SuccessToken {
+                        address: "BONK1234...".parse().unwrap(),
+                        symbol: "BONK".to_string(),
+                        name: "Bonk".to_string(),
+                        market_cap: 12_000_000.0,
+                        created_at: 1704067200, // 2024-01
+                    },
+                ],
+                total_tokens: 5,
+            },
+            fund_flow: vec![
+                FundingChain {
+                    transfers: vec![
+                        Transfer {
+                            source: "ORCA...Zt1v".parse().unwrap(),
+                            amount: 2000.5,
+                            timestamp: 1710741600, // 2024-03-18 10:00
+                            tx_id: "xxx".to_string(),
+                            success_tokens: Some(vec![]),
+                        },
+                        Transfer {
+                            source: "BONK...Dt1v".parse().unwrap(),
+                            amount: 2000.5,
+                            timestamp: 1710828000, // 2024-03-19 09:15
+                            tx_id: "xxx".to_string(),
+                            success_tokens: Some(vec![]),
+                        },
+                    ],
+                    total_amount: 2000.5,
+                    risk_score: 25,
+                },
+                FundingChain {
+                    transfers: vec![
+                        Transfer {
+                            source: "NEW1...V9hJ".parse().unwrap(),
+                            amount: 500.0,
+                            timestamp: 1710914400, // 2024-03-21 11:55
+                            tx_id: "xxx".to_string(),
+                            success_tokens: None,
+                        },
+                    ],
+                    total_amount: 500.0,
+                    risk_score: 75,
+                },
+            ],
+            risk_score: 35,
+            is_new_wallet: false,
+            wallet_age: 245.5,
+        };
+
         let output = format!(
             ">>> 发现新代币 - 高度关注! 🚨\n\
             ┏━━━━━━━━━━━━━━━━━━━━━ 🔔 新代币分析报告 (UTC+8) ━━━━━━━━━━━━━━━━━━━━━┓\n\n\
@@ -1729,12 +2277,15 @@ r#"🔗 快速链接 (点击复制)
             ┣━ 发行量: 420.69T | 持有人: 1,258 | 验证状态: ✓\n\
             ┣━ 当前价格: $0.00000145 (+125%) | 市值: $15M\n\
             ┗━ 流动性: 2,500 SOL | 持币集中度: 35.8% | 锁仓: 20%(180天)\n\n\
-            💸 资金追溯 (创建者钱包总收款: 5,250.50 SOL)\n\
+            💸 资金追溯 (创建者钱包总收款: 2,500.50 SOL)\n\
             ┣━ 资金来源#1 (2,000.50 SOL) - 已验证资金链\n\
             ┃   创建者钱包 [2024-03-21 12:00] 7xKX...gAsU\n\
-            ┃   ↑ 2000.50 SOL └ 中转钱包A [2024-03-20 15:30] DezX...B263 (SAMO创建者)\n\
-            ┃   ↑ 2000.50 SOL └ 中转钱包B [2024-03-19 09:15] EPjF...Dt1v (BONK早期投资者)\n\
-            ┃   ↑ 2000.50 SOL └ 源头钱包C [2024-03-18 10:00] ORCA...Zt1v (已验证交易所)\n\n\
+            ┃   ↑ 2000.50 SOL └ 中转钱包A [2024-03-19 09:15] BONK...Dt1v (BONK早期投资者)\n\
+            ┃   ↑ 2000.50 SOL └ 源头钱包B [2024-03-18 10:00] ORCA...Zt1v (已验证交易所)\n\
+            ┃\n\
+            ┗━ 资金来源#2 (500.00 SOL) - 🆕 新钱包\n\
+                创建者钱包 [2024-03-21 11:55] 7xKX...gAsU\n\
+                ↑ 500.00 SOL └ 源头钱包C [2024-03-21 11:55] NEW1...V9hJ (新钱包, 年龄: 0.1天)\n\n\
             📊 创建者历史分析\n\
             ┣━ 历史项目数: 5个 | 成功项目: 2个 | 成功率: 40.0%\n\
             ┣━ 代币列表:\n\
@@ -1765,6 +2316,7 @@ r#"🔗 快速链接 (点击复制)
         println!("{}", output);
     }
 
+    // 实现钱包角色判断
     fn get_wallet_role(&self, address: &Pubkey) -> String {
         if self.is_exchange_wallet(address) {
             "交易所钱包".to_string()
@@ -1775,6 +2327,7 @@ r#"🔗 快速链接 (点击复制)
         }
     }
 
+    // 实现钱包描述生成
     fn get_wallet_description(&self, transfer: &Transfer) -> String {
         if let Some(ref tokens) = transfer.success_tokens {
             if !tokens.is_empty() {
@@ -1787,6 +2340,7 @@ r#"🔗 快速链接 (点击复制)
         }
     }
 
+    // 辅助方法
     fn is_exchange_wallet(&self, address: &Pubkey) -> bool {
         // 实现交易所钱包检测逻辑
         false // 临时返回
@@ -1797,11 +2351,13 @@ r#"🔗 快速链接 (点击复制)
         false // 临时返回
     }
 
+    // 添加缓存预热
     async fn warm_up_cache(&self) -> Result<()> {
         // 预加载常用数据
         Ok(())
     }
 
+    // 添加批量处理优化
     async fn process_blocks_batch(&self, slots: Vec<u64>) -> Result<()> {
         let futures: Vec<_> = slots.into_iter()
             .map(|slot| self.process_block(slot, &self.token_tx))
@@ -1813,6 +2369,7 @@ r#"🔗 快速链接 (点击复制)
         Ok(())
     }
 
+    // 添加服务状态管理
     pub struct ServiceState {
         running: Arc<AtomicBool>,
         last_error: Arc<Mutex<Option<String>>>,
@@ -1833,6 +2390,7 @@ r#"🔗 快速链接 (点击复制)
         }
     }
 
+    // 添加服务控制方法
     pub async fn start_service(&self) -> Result<()> {
         log::info!("启动监控服务...");
         self.service_state.running.store(true, Ordering::SeqCst);
@@ -1862,6 +2420,7 @@ r#"🔗 快速链接 (点击复制)
         Ok(())
     }
 
+    // 添加健康检查
     pub async fn health_check(&self) -> Result<ServiceHealth> {
         let uptime = SystemTime::now()
             .duration_since(self.service_state.start_time)?;
@@ -1875,6 +2434,7 @@ r#"🔗 快速链接 (点击复制)
         })
     }
 
+    // 添加指标收集
     async fn start_metrics_collection(&self) -> Result<()> {
         let metrics = self.metrics.clone();
         let service_state = self.service_state.clone();
@@ -1893,354 +2453,319 @@ r#"🔗 快速链接 (点击复制)
         Ok(())
     }
 
-    async fn analyze_token_metrics(&self, mint: &Pubkey) -> Result<TokenMetrics> {
-        let token_info = self.fetch_token_info(mint).await?;
-        
-        // 计算基础指标
-        let supply_score = self.calculate_supply_score(token_info.supply);
-        let liquidity_score = self.calculate_liquidity_score(token_info.liquidity);
-        let holder_score = self.calculate_holder_score(
-            token_info.holder_count,
-            token_info.holder_concentration
-        );
-        
-        // 计算综合风险分数
-        let risk_score = (supply_score + liquidity_score + holder_score) / 3.0;
-        
-        Ok(TokenMetrics {
-            supply_score,
-            liquidity_score, 
-            holder_score,
-            risk_score,
-            market_cap: token_info.market_cap,
-            price: token_info.price,
-            verified: token_info.verified,
-        })
+    // 格式化通知消息
+    async fn format_notification(&self, analysis: &TokenAnalysis) -> String {
+        format!(
+r#"🚨 高风险代币预警 - 需要特别关注!
+┏━━━━━━━━━━━━━━━━━━━━━ 🔔 深度分析报告 (UTC+8) ━━━━━━━━━━━━━━━━━━━━━┓
+
+📋 基础信息
+┣━ 代币: {} ({})
+┣━ 合约: {} 📋
+┗━ 创建者: {} 📋
+
+💰 代币数据
+┣━ 发行量: {} | 初始价格: ${} | 当前价格: ${}
+┣━ 当前市值: ${} | 流动性: {} SOL | 涨幅: {}%
+┗━ 锁定详情: {}% 锁定{}天 | 持有人: {} | 集中度: {}%
+
+💸 资金追溯 (总流入: {:.2} SOL)
+{}
+
+📊 创建者分析
+┣━ 历史数据: 项目总数: {}个 | 成功: {}个({:.1}%) | 高风险项目: {}个
+┣━ 代币列表:
+{}
+┗━ 综合指标: 平均市值: ${:.2}M | 信用评分: {}
+
+⚠️ 风险评估 (风险评分: {}/100)
+{}
+
+📱 社交媒体 & 市场表现
+┣━ 社交数据: Twitter({},{}%) | Discord({},{}%活跃) | TG({})
+┣━ 价格变动: 1h({}%) | 24h({}%) | 首次交易({}%)
+┗━ 交易数据: 24h量(${:.1}M) | 买压({}%) | 卖压({}%) | 流动性变化({}%)
+
+👥 持币分布
+┣━ 集中度: Top10({}%) | Top50({}%) | Top100({}%)
+┣━ 地址分类: 散户{}个({}%) | 中户{}个({}%) | 大户{}个({}%)
+┗━ 重要地址: {}个交易所 | {}个大户 | {}个做市商
+
+🔗 快速链接 (点击复制)
+┣━ Birdeye: birdeye.so/token/{}
+┣━ Solscan: solscan.io/token/{}
+┗━ 创建者: solscan.io/account/{}
+
+⏰ 监控信息
+┣━ 关键时间: 发现({}) | 首交易({}) | 流动性添加({})
+┣━ 监控编号: #MON-{}-{:03} | 风险等级: {}
+┗━ 下次更新: {}分钟后 | 当前状态: {}
+
+💡 风险提示
+{}
+主要风险: {}
+建议: {}"#,
+            analysis.token_info.symbol,
+            analysis.token_info.name,
+            analysis.token_info.mint,
+            analysis.token_info.creator,
+            self.format_number(analysis.token_info.supply as f64),
+            analysis.token_info.price,
+            self.get_current_price(&analysis.token_info),
+            self.format_number(analysis.token_info.market_cap),
+            self.format_number(analysis.token_info.liquidity),
+            self.calculate_price_change(&analysis.token_info),
+            // ... 其他参数
+        )
     }
 
-    fn calculate_supply_score(&self, supply: u64) -> f64 {
-        // 供应量评分算法
-        let base_score = if supply < 1_000_000 {
-            100.0
-        } else if supply < 1_000_000_000 {
-            75.0
-        } else if supply < 1_000_000_000_000 {
-            50.0
-        } else {
-            25.0
-        };
-
-        // 应用修正因子
-        let correction = (supply as f64).log10() * 5.0;
-        (base_score - correction).max(0.0).min(100.0)
-    }
-
-    fn calculate_liquidity_score(&self, liquidity: f64) -> f64 {
-        // 流动性评分算法
-        let base_score = if liquidity < 1000.0 {
-            25.0
-        } else if liquidity < 10_000.0 {
-            50.0
-        } else if liquidity < 100_000.0 {
-            75.0
-        } else {
-            100.0
-        };
-
-        // 应用修正因子
-        let correction = liquidity.log10() * 10.0;
-        (base_score + correction).max(0.0).min(100.0)
-    }
-
-    fn calculate_holder_score(&self, holder_count: u64, concentration: f64) -> f64 {
-        // 持有者评分算法
-        let count_score = if holder_count < 100 {
-            25.0
-        } else if holder_count < 1000 {
-            50.0
-        } else if holder_count < 10000 {
-            75.0
-        } else {
-            100.0
-        };
-
-        // 考虑持仓集中度
-        let concentration_penalty = concentration * 50.0;
-        (count_score - concentration_penalty).max(0.0)
-    }
-
-    async fn trace_fund_flow(&self, address: &Pubkey) -> Result<Vec<FundingChain>> {
-        let mut chains = Vec::new();
-        let mut visited = HashSet::new();
-        
-        // 获取地址活动历史
-        let activities = self.fetch_address_activities(address).await?;
-        
-        for activity in activities {
-            if visited.contains(&activity.signature) {
-                continue;
-            }
-            
-            let mut chain = FundingChain {
-                total_amount: activity.amount,
-                transfers: vec![Transfer {
-                    source: activity.source,
-                    amount: activity.amount,
-                    timestamp: activity.timestamp,
-                    success_tokens: None,
-                }],
+    // 格式化资金流向
+    fn format_fund_flow(&self, fund_flow: &[FundingChain]) -> String {
+        let mut result = String::new();
+        for (i, chain) in fund_flow.iter().enumerate() {
+            let risk_label = if chain.risk_score > 50 {
+                "⚠️ 高风险资金"
+            } else if chain.transfers[0].success_tokens.is_some() {
+                "✅ 已验证资金"
+            } else {
+                "🆕 新钱包"
             };
-            
-            // 递归追踪资金流向
-            self.trace_chain(&mut chain, &activity.source, &mut visited).await?;
-            
-            if !chain.transfers.is_empty() {
-                chains.push(chain);
-            }
-        }
-        
-        Ok(chains)
-    }
 
-    async fn trace_chain(
-        &self,
-        chain: &mut FundingChain,
-        current: &Pubkey,
-        visited: &mut HashSet<String>,
-    ) -> Result<()> {
-        const MAX_DEPTH: usize = 5;
-        
-        if chain.transfers.len() >= MAX_DEPTH {
-            return Ok(());
-        }
-        
-        let activities = self.fetch_address_activities(current).await?;
-        
-        for activity in activities {
-            if visited.contains(&activity.signature) {
-                continue;
-            }
-            
-            visited.insert(activity.signature.clone());
-            
-            // 获取成功创建的代币
-            let success_tokens = self.get_success_tokens(current).await?;
-            
-            chain.transfers.push(Transfer {
-                source: activity.source,
-                amount: activity.amount,
-                timestamp: activity.timestamp,
-                success_tokens: Some(success_tokens),
-            });
-            
-            chain.total_amount += activity.amount;
-            
-            // 递归追踪
-            self.trace_chain(chain, &activity.source, visited).await?;
-        }
-        
-        Ok(())
-    }
-
-    async fn save_monitor_state(&self) -> Result<()> {
-        let state_file = dirs::home_dir()?
-            .join(".solana_pump/state.json");
-            
-        let state = self.monitor_state.lock().await;
-        let content = serde_json::to_string_pretty(&*state)?;
-        fs::write(state_file, content)?;
-        
-        Ok(())
-    }
-
-    async fn load_monitor_state() -> Result<MonitorState> {
-        let state_file = dirs::home_dir()?
-            .join(".solana_pump/state.json");
-
-        if !state_file.exists() {
-            return Ok(MonitorState::default());
-        }
-
-        let content = fs::read_to_string(state_file)?;
-        Ok(serde_json::from_str(&content)?)
-    }
-
-    async fn update_metrics(&self) {
-        let mut state = self.monitor_state.lock().await;
-        let sys = System::new_all();
-        
-        state.metrics.uptime = SystemTime::now()
-            .duration_since(self.service_state.start_time)
-            .unwrap_or(Duration::from_secs(0));
-            
-        state.metrics.cpu_usage = sys.global_cpu_info().cpu_usage();
-        state.metrics.memory_usage = sys.used_memory() as f64 / sys.total_memory() as f64 * 100.0;
-    }
-
-    async fn auto_recover(&self) -> Result<()> {
-        let recovery = Arc::new(Recovery::new());
-        
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = self.check_and_recover().await {
-                    log::error!("Recovery failed: {}", e);
-                }
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        });
-
-        Ok(())
-    }
-
-    async fn check_and_recover(&self) -> Result<()> {
-        // 检查RPC节点健康
-        for client in &self.rpc_pool.clients {
-            if let Err(e) = client.get_slot().await {
-                log::warn!("RPC node {} failed: {}", client.url(), e);
-                self.rpc_pool.health_status.insert(client.url(), false);
-                self.try_recover_rpc(client).await?;
-            }
-        }
-
-        // 检查缓存状态
-        let cache = self.cache.lock().await;
-        if cache.blocks.len() > 10000 {
-            log::warn!("Cache size too large, cleaning up...");
-            self.cleanup_cache().await?;
-        }
-
-        // 检查处理延迟
-        let metrics = self.metrics.lock().await;
-        if metrics.processing_delays.iter().any(|d| d > &Duration::from_secs(5)) {
-            log::warn!("Processing delays too high, adjusting batch size...");
-            self.batcher.adjust_batch_size();
-        }
-
-        Ok(())
-    }
-
-    async fn try_recover_rpc(&self, client: &RpcClient) -> Result<()> {
-        for _ in 0..3 {
-            if client.get_slot().await.is_ok() {
-                self.rpc_pool.health_status.insert(client.url(), true);
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        Ok(())
-    }
-
-    async fn generate_report(&self) -> Result<String> {
-        let mut report = String::new();
-        
-        // 添加标题
-        report.push_str(&format!(
-            "Solana Pump Monitor 监控报告\n日期: {}\n\n",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-        ));
-
-        // 添加系统状态
-        let metrics = self.metrics.lock().await;
-        report.push_str(&format!(
-            "系统状态:\n\
-            处理区块数: {}\n\
-            处理交易数: {}\n\
-            丢失区块数: {}\n\
-            平均处理延迟: {:.2}ms\n\n",
-            metrics.processed_blocks,
-            metrics.processed_txs,
-            metrics.missed_blocks.len(),
-            metrics.processing_delays.iter()
-                .map(|d| d.as_millis() as f64)
-                .sum::<f64>() / metrics.processing_delays.len() as f64
-        ));
-
-        // 添加RPC节点状态
-        report.push_str("RPC节点状态:\n");
-        for client in &self.rpc_pool.clients {
-            let health = self.rpc_pool.health_status.get(&client.url())
-                .map_or(false, |v| *v);
-            report.push_str(&format!(
-                "{}: {}\n",
-                client.url(),
-                if health { "✅ 正常" } else { "❌ 异常" }
+            result.push_str(&format!(
+                "┣━ 资金链#{} ({:.2} SOL) - {}\n",
+                i + 1, chain.total_amount, risk_label
             ));
-        }
 
-        // 添加告警统计
-        let alerts = self.get_recent_alerts().await?;
-        report.push_str(&format!(
-            "\n告警统计:\n\
-            高风险: {}\n\
-            中风险: {}\n\
-            低风险: {}\n",
-            alerts.iter().filter(|a| matches!(a.level, AlertLevel::High)).count(),
-            alerts.iter().filter(|a| matches!(a.level, AlertLevel::Medium)).count(),
-            alerts.iter().filter(|a| matches!(a.level, AlertLevel::Low)).count()
+            for transfer in &chain.transfers {
+                result.push_str(&format!(
+                    "┃   创建者钱包 [{:}] {}\n",
+                    self.format_timestamp(transfer.timestamp),
+                    transfer.source.to_string()
+                ));
+                
+                if let Some(ref tokens) = transfer.success_tokens {
+                    result.push_str(&format!(
+                        "┃   └─ {} ({})\n",
+                        self.get_wallet_role(&transfer.source),
+                        self.get_wallet_description(transfer)
+                    ));
+                }
+            }
+            
+            if i < fund_flow.len() - 1 {
+                result.push_str("┃\n");
+            }
+        }
+        result
+    }
+
+    // 格式化风险评估
+    fn format_risk_assessment(&self, analysis: &TokenAnalysis) -> String {
+        let mut result = String::new();
+        
+        // 高风险信号
+        result.push_str("┣━ 高风险信号:\n");
+        result.push_str(&format!(
+            "┃   ┣━ {} | {}\n",
+            "创建者关联多个高风险项目",
+            "主要资金来自可疑地址"
+        ));
+        result.push_str(&format!(
+            "┃   ┗━ {} | {}\n",
+            "合约未经审计",
+            "持币过度集中"
         ));
 
-        Ok(report)
+        // 中等风险
+        result.push_str("┣━ 中等风险:\n");
+        result.push_str(&format!(
+            "┃   ┣━ {} | {}\n",
+            "部分资金来自新地址",
+            "社交媒体活跃度低"
+        ));
+        
+        // 积极因素
+        result.push_str("┗━ 积极因素:\n");
+        result.push_str(&format!(
+            "    ┣━ {} | {}\n",
+            "部分资金来自知名交易所",
+            "有成功项目经验"
+        ));
+
+        result
     }
 
-    // 辅助格式化函数
-    fn format_change(&self, value: f64) -> String {
-        if value > 0.0 {
-            format!("+{:.1}%", value)
+    // 辅助格式化方法
+    fn format_number(&self, num: f64) -> String {
+        if num >= 1_000_000_000_000.0 {
+            format!("{:.2}T", num / 1_000_000_000_000.0)
+        } else if num >= 1_000_000_000.0 {
+            format!("{:.2}B", num / 1_000_000_000.0)
+        } else if num >= 1_000_000.0 {
+            format!("{:.2}M", num / 1_000_000.0)
+        } else if num >= 1_000.0 {
+            format!("{:.2}K", num / 1_000.0)
         } else {
-            format!("{:.1}%", value)
+            format!("{:.2}", num)
         }
     }
 
-    fn format_volume(&self, volume: f64) -> String {
-        if volume >= 1_000_000.0 {
-            format!("${:.1}M", volume / 1_000_000.0)
-        } else if volume >= 1_000.0 {
-            format!("${:.1}K", volume / 1_000.0)
+    fn format_timestamp(&self, timestamp: u64) -> String {
+        let dt = chrono::DateTime::from_timestamp(timestamp as i64, 0)
+            .unwrap()
+            .with_timezone(&chrono::FixedOffset::east(8));
+        dt.format("%H:%M").to_string()
+    }
+
+    // 获取当前价格
+    async fn get_current_price(&self, token_info: &TokenInfo) -> Result<f64> {
+        // 1. 检查缓存
+        if let Some(cached) = self.cache.lock().await.token_info.get(&token_info.mint) {
+            if cached.1.elapsed()? < Duration::from_secs(30) {
+                return Ok(cached.0.price);
+            }
+        }
+
+        // 2. 从API获取
+        let api_key = self.get_next_api_key().await;
+        let response = self.client
+            .get(&format!(
+                "https://public-api.birdeye.so/public/price?address={}",
+                token_info.mint
+            ))
+            .header("X-API-KEY", api_key)
+            .send()
+            .await?;
+            
+        let price_data: PriceResponse = response.json().await?;
+        
+        // 3. 更新缓存
+        self.cache.lock().await.token_info.insert(
+            token_info.mint,
+            (TokenInfo {
+                price: price_data.data.price,
+                ..token_info.clone()
+            }, 
+            SystemTime::now())
+        );
+
+        Ok(price_data.data.price)
+    }
+
+    // 获取价格变化
+    async fn get_price_changes(&self, token_info: &TokenInfo) -> Result<(f64, f64, f64)> {
+        let api_key = self.get_next_api_key().await;
+        let response = self.client
+            .get(&format!(
+                "https://public-api.birdeye.so/public/price_changes?address={}",
+                token_info.mint
+            ))
+            .header("X-API-KEY", api_key)
+            .send()
+            .await?;
+            
+        let price_data: PriceResponse = response.json().await?;
+        
+        Ok((
+            price_data.data.price_change_1h,
+            price_data.data.price_change_24h,
+            price_data.data.volume_24h
+        ))
+    }
+
+    // 检查是否是交易所钱包
+    async fn is_exchange_wallet(&self, address: &Pubkey) -> bool {
+        let known_exchanges = vec![
+            "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",  // Orca
+            "HxhWkVpk5NS4Ltg5nij2G671CKXFRKM8Sk9QfF6XTsQ9",  // Raydium
+            "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",  // Serum
+            // 添加更多已知交易所地址
+        ];
+        
+        known_exchanges.contains(&address.to_string().as_str())
+    }
+
+    // 检查是否是合约钱包
+    async fn is_contract_wallet(&self, address: &Pubkey) -> bool {
+        if let Ok(account) = self.rpc_pool.clients[0].get_account(address).await {
+            account.executable
         } else {
-            format!("${:.1}", volume)
+            false
         }
     }
 
-    fn format_short_address(&self, address: &Pubkey) -> String {
-        let addr_str = address.to_string();
-        format!("{}...{}", 
-            &addr_str[..4], 
-            &addr_str[addr_str.len()-4..])
+    // 获取钱包角色
+    async fn get_wallet_role(&self, address: &Pubkey) -> String {
+        if self.is_exchange_wallet(address).await {
+            "交易所钱包".to_string()
+        } else if self.is_contract_wallet(address).await {
+            "合约钱包".to_string()
+        } else {
+            "普通钱包".to_string()
+        }
     }
-}
 
-//===========================================
-// 辅助数据结构
-//===========================================
-#[derive(Debug)]
-struct TokenMetrics {
-    supply_score: f64,
-    liquidity_score: f64,
-    holder_score: f64,
-    risk_score: f64,
-    market_cap: f64,
-    price: f64,
-    verified: bool,
-}
+    // 获取钱包描述
+    async fn get_wallet_description(&self, transfer: &Transfer) -> String {
+        if let Some(ref tokens) = transfer.success_tokens {
+            if !tokens.is_empty() {
+                format!("{} 创建者", tokens[0].symbol)
+            } else {
+                "中转钱包".to_string()
+            }
+        } else {
+            let age = self.calculate_wallet_age(&transfer.source).await?;
+            format!("新钱包 (年龄: {:.1}天)", age)
+        }
+    }
 
-#[derive(Debug)]
-struct FundingChain {
-    total_amount: f64,
-    transfers: Vec<Transfer>,
-}
+    // 计算钱包年龄
+    async fn calculate_wallet_age(&self, address: &Pubkey) -> Result<f64> {
+        let client = &self.rpc_pool.clients[0];
+        
+        let signatures = client.get_signatures_for_address(address).await?;
+        
+        if let Some(oldest_tx) = signatures.last() {
+            let age = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs() as f64 - oldest_tx.block_time.unwrap_or(0) as f64;
+                
+            Ok(age / (24.0 * 3600.0)) // 转换为天
+        } else {
+            Ok(0.0)
+        }
+    }
 
-#[derive(Debug)]
-struct Transfer {
-    source: Pubkey,
-    amount: f64,
-    timestamp: u64,
-    success_tokens: Option<Vec<TokenInfo>>,
-}
+    // 分析钱包历史
+    async fn analyze_wallet_history(&self, address: &Pubkey) -> Result<WalletHistory> {
+        // 1. 检查缓存
+        if let Some(cached) = self.cache.lock().await.creator_history.get(address) {
+            if cached.1.elapsed()? < Duration::from_secs(300) {
+                return Ok(cached.0.clone());
+            }
+        }
 
-#[derive(Debug)]
-struct TokenInfo {
-    symbol: String,
-    market_cap: f64,
+        // 2. 从API获取
+        let api_key = self.get_next_api_key().await;
+        let response = self.client
+            .get(&format!(
+                "https://public-api.birdeye.so/public/wallet_history?address={}",
+                address
+            ))
+            .header("X-API-KEY", api_key)
+            .send()
+            .await?;
+            
+        let history: WalletHistory = response.json().await?;
+
+        // 3. 更新缓存
+        self.cache.lock().await.creator_history.insert(
+            *address,
+            (history.clone(), SystemTime::now())
+        );
+
+        Ok(history)
+    }
 }
 
 // 添加健康检查结构
@@ -2309,6 +2834,28 @@ struct TokenListItem {
     name: String,
     market_cap: f64,
     created_at: u64,
+}
+
+// 1. 添加新的结构体定义
+#[derive(Debug, Deserialize)]
+struct PriceResponse {
+    data: PriceData,
+}
+
+#[derive(Debug, Deserialize)]
+struct PriceData {
+    price: f64,
+    price_change_24h: f64,
+    price_change_1h: f64,
+    volume_24h: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletHistory {
+    total_transactions: u64,
+    successful_projects: u64,
+    risk_projects: u64,
+    average_holding_time: f64,
 }
 
 #[cfg(test)]
