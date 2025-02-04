@@ -22,9 +22,10 @@ use solana_transaction_status::{
     EncodedConfirmedBlock,
     EncodedTransaction,
     UiTransactionEncoding,
+    UiInstruction,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, Instant, UNIX_EPOCH},
     io::Read,
@@ -68,6 +69,12 @@ impl AppConfig {
             
         let content = fs::read_to_string(config_path)?;
         Ok(serde_json::from_str(&content)?)
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig { api_keys: Vec::new(), serverchan: ServerChanConfig::default(), wcf: WeChatFerryConfig::default(), proxy: ProxyConfig::default(), rpc_nodes: HashMap::new() }
     }
 }
 
@@ -231,15 +238,23 @@ struct MonitorState {
     watch_addresses: HashSet<String>,
     metrics: MonitorMetrics,
     start_time: TimeWrapper,
+    last_block_slot: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct MonitorMetrics {
+    pub metrics: Metrics,
+    pub rpc_health: HashMap<String, bool>,
+    pub last_alert_time: SystemTime,
+    pub monitor_start_time: SystemTime,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Metrics {
+    pub processing_delays: VecDeque<Duration>,
+    pub missed_blocks: Vec<u64>,
     pub processed_blocks: u64,
     pub processed_txs: u64,
-    pub missed_blocks: u64,
-    pub processing_delays: Vec<u64>,
-    pub last_process_time: DefaultInstant, // 使用包装类型
     pub retry_counts: AtomicUsize,
 }
 
@@ -251,8 +266,8 @@ impl Metrics {
 
 #[derive(Debug)]
 pub struct RpcPool {
-    pub clients: Vec<Arc<DebugRpcClient>>,
     pub health_status: DashMap<String, bool>,
+    pub clients: Arc<TokioMutex<Vec<Arc<DebugRpcClient>>>>, // 修改为 Mutex<Vec<Arc<DebugRpcClient>>>
     pub current_index: AtomicUsize,
 }
 
@@ -263,8 +278,8 @@ impl RpcPool {
             .collect();
         
         Self {
-            clients: debug_clients,
             health_status: DashMap::new(),
+            clients: Arc::new(TokioMutex::new(debug_clients)),
             current_index: AtomicUsize::new(0),
         }
     }
@@ -394,6 +409,7 @@ struct MonitorState {
     watch_addresses: HashSet<String>,
     metrics: MonitorMetrics,
     start_time: TimeWrapper,
+    last_block_slot: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,7 +419,7 @@ pub struct Alert {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AlertLevel {
     High,
     Medium,
@@ -416,6 +432,11 @@ pub struct MonitorMetrics {
     pub processed_txs: u64,
     pub rpc_requests: u64,
     pub rpc_errors: u64,
+    pub missed_blocks: Vec<u64>,
+    pub processing_delays: VecDeque<Duration>,
+    pub block_processing_latency: AtomicU64,
+    pub tx_processing_latency: AtomicU64,
+    pub token_analysis_latency: AtomicU64,
 }
 
 //===========================================
@@ -709,8 +730,8 @@ impl TokenMonitor {
         let mut monitor = Self {
             config: config.clone(),
             rpc_pool: Arc::new(RpcPool {
-                clients: Vec::new(),
                 health_status: DashMap::new(),
+                clients: Arc::new(TokioMutex::new(Vec::new())), // 修改为 Mutex<Vec<Arc<DebugRpcClient>>>
                 current_index: AtomicUsize::new(0),
             }),
             cache: Arc::new(TokioMutex::new(CacheSystem::new())),
@@ -759,6 +780,7 @@ impl TokenMonitor {
             proxy_pool: monitor.proxy_pool,
             service_state: monitor.service_state,
             last_alert: tokio::sync::Mutex::new(SystemTime::now()),
+            last_block_slot: 0,
         })
     }
 
@@ -772,10 +794,15 @@ impl TokenMonitor {
         ];
 
         for url in default_nodes {
-            self.rpc_pool.clients.push(Arc::new(DebugRpcClient(RpcClient::new_with_commitment(
-                url.to_string(),
-                CommitmentConfig::confirmed(),
-            ))));
+            let client = DebugRpcClient::new(url.to_string());
+            let client_arc = Arc::new(client);
+
+            {
+                let mut clients = self.rpc_pool.clients.lock().await; // 获取 Mutex 的可变引用
+                clients.push(client_arc.clone()); // 使用 clients.push
+            }
+            self.rpc_pool.health_status.insert(url.clone(), true);
+            log::info!("添加 RPC 节点: {}", url);
         }
     }
 
@@ -915,16 +942,20 @@ impl TokenMonitor {
     }
 
     fn extract_pump_info(&self, tx: &EncodedTransaction) -> Option<(Pubkey, Pubkey)> {
-        let message = &tx.message;
-        
-        if !message.account_keys.contains(&self.pump_program) {
-            return None;
+        if let EncodedTransaction::Json(tx_json) = tx {
+            if let Some(message) = &tx_json.message {
+                if let Some(account_keys) = &message.account_keys {
+                    if account_keys.contains(&self.pump_program) {
+                        // 从交易中提取代币地址和创建者地址
+                        return Some((
+                            account_keys[1], // 假设代币地址在第二个位置
+                            account_keys[0]  // 假设创建者地址在第一个位置
+                        ));
+                    }
+                }
+            }
         }
-        
-        Some((
-            message.account_keys[4],
-            message.account_keys[0],
-        ))
+        None
     }
 
     async fn get_next_api_key(&self) -> String {
@@ -1911,10 +1942,12 @@ impl TokenMonitor {
     async fn check_and_recover(&self) -> Result<()> {
         // 检查RPC节点健康
         for client in &self.rpc_pool.clients {
-            if let Err(e) = client.0.get_slot().await {
+            if let Err(e) = client.0.get_slot() {
                 log::warn!("RPC node {} failed: {}", client.0.url(), e);
                 self.rpc_pool.health_status.insert(client.0.url(), false);
                 self.try_recover_rpc(client).await?;
+            } else {
+                self.rpc_pool.health_status.insert(client.0.url(), true);
             }
         }
 
@@ -1927,7 +1960,7 @@ impl TokenMonitor {
 
         // 检查处理延迟
         let metrics = self.metrics.lock().await;
-        if metrics.processing_delays.iter().any(|d| d > &Duration::from_secs(5)) {
+        if metrics.processing_delays.iter().any(|d| *d > Duration::from_secs(5)) {
             log::warn!("Processing delays too high, adjusting batch size...");
             self.batcher.adjust_batch_size();
         }
@@ -1937,7 +1970,7 @@ impl TokenMonitor {
 
     async fn try_recover_rpc(&self, client: &Arc<DebugRpcClient>) -> Result<()> {
         for _ in 0..3 {
-            if client.0.get_slot().await.is_ok() {
+            if client.0.get_slot().is_ok() {
                 self.rpc_pool.health_status.insert(client.0.url(), true);
                 return Ok(());
             }
@@ -2065,7 +2098,7 @@ impl TokenMonitor {
 
     pub fn generate_risk_alert(&self, analysis: &TokenAnalysis) -> String {
         // 资金流格式化
-        let fund_flows = analysis.fund_flows.iter().enumerate().map(|(i, flow)| {
+        let fund_flows = analysis.fund_flow.iter().enumerate().map(|(i, flow)| {
             let arrow = "↑".repeat(3);
             let flow_type = match flow.risk_level {
                 0..=30 => "✅ 低风险资金",
@@ -2087,15 +2120,15 @@ impl TokenMonitor {
         }).collect::<Vec<_>>().join("\n");
 
         // 创建者历史格式化
-        let creator_history = analysis.creator_projects.iter().map(|p| {
+        let creator_history = analysis.creator_history.projects.iter().map(|p| {
             format!(
                 "┃   ┣━ {}. {}: ${:.1}M ({})",
-                p.index, p.name, p.market_cap, p.date
+                p.index, p.project_name, p.market_cap / 1_000_000.0, p.project_type
             )
         }).collect::<Vec<_>>().join("\n");
 
         // 持币分布格式化
-        let holder_distribution = analysis.holder_distribution.iter().map(|(category, percent)| {
+        let holder_distribution = analysis.holder_distribution.holder_categories.iter().map(|(category, percent)| {
             format!("┣━ {}: {:.1}%", category, percent)
         }).collect::<Vec<_>>().join("\n");
 
@@ -2155,35 +2188,35 @@ impl TokenMonitor {
 💡 风险提示
 {}
 "#,
-            analysis.name,
-            analysis.symbol,
-            self.format_short_address(&analysis.mint),
-            self.format_short_address(&analysis.creator),
-            analysis.total_supply,
-            analysis.initial_price,
-            analysis.current_price,
-            analysis.market_cap / 1_000_000.0,
-            analysis.liquidity,
+            analysis.token_info.name,
+            analysis.token_info.symbol,
+            self.format_short_address(&analysis.token_info.mint),
+            self.format_short_address(&analysis.token_info.creator),
+            analysis.token_info.total_supply,
+            analysis.token_info.initial_price,
+            analysis.token_info.current_price,
+            analysis.token_info.market_cap / 1_000_000.0,
+            analysis.token_info.liquidity,
             analysis.price_change_24h * 100.0,
-            analysis.lock_details,
-            analysis.holder_count,
-            analysis.holder_concentration * 100.0,
-            analysis.total_inflow,
+            analysis.token_info.lock_details,
+            analysis.token_info.holder_count,
+            analysis.token_info.holder_concentration * 100.0,
+            analysis.token_info.total_inflow,
             fund_flows,
-            analysis.creator_project_count,
-            analysis.creator_success_count,
-            (analysis.creator_success_count as f64 / analysis.creator_project_count as f64) * 100.0,
-            analysis.creator_high_risk_count,
+            analysis.creator_history.project_count,
+            analysis.creator_history.success_count,
+            (analysis.creator_history.success_count as f64 / analysis.creator_history.project_count as f64) * 100.0,
+            analysis.creator_history.high_risk_count,
             creator_history,
-            analysis.creator_avg_market_cap / 1_000_000.0,
-            analysis.creator_credit_rating,
+            analysis.creator_history.avg_market_cap / 1_000_000.0,
+            analysis.creator_history.credit_rating,
             analysis.risk_score,
-            analysis.high_risk_factors[0],
-            analysis.high_risk_factors[1],
-            analysis.medium_risk_factors[0],
-            analysis.medium_risk_factors[1],
-            analysis.positive_factors[0],
-            analysis.positive_factors[1],
+            analysis.risk_factors.high_risk[0],
+            analysis.risk_factors.high_risk[1],
+            analysis.risk_factors.medium_risk[0],
+            analysis.risk_factors.medium_risk[1],
+            analysis.risk_factors.positive[0],
+            analysis.risk_factors.positive[1],
             analysis.social.twitter_followers,
             analysis.social.twitter_growth * 100.0,
             analysis.social.discord_members,
@@ -2197,15 +2230,15 @@ impl TokenMonitor {
             analysis.sell_pressure * 100.0,
             analysis.liquidity_change * 100.0,
             holder_distribution,
-            analysis.exchange_wallets,
-            analysis.whale_wallets,
-            analysis.market_makers,
-            format!("birdeye.so/token/{}", analysis.mint),
-            format!("solscan.io/token/{}", analysis.mint),
-            format!("solscan.io/account/{}", analysis.creator),
-            analysis.detection_time.format("%m-%d %H:%M"),
-            analysis.first_trade_time.format("%m-%d %H:%M"),
-            analysis.liquidity_add_time.format("%m-%d %H:%M"),
+            analysis.holder_distribution.exchange_wallets,
+            analysis.holder_distribution.whale_wallets,
+            analysis.holder_distribution.market_makers,
+            format!("birdeye.so/token/{}", analysis.token_info.mint),
+            format!("solscan.io/token/{}", analysis.token_info.mint),
+            format!("solscan.io/account/{}", analysis.token_info.creator),
+            TimeWrapper::from(analysis.detection_time.clone()).to_datetime_local().format("%m-%d %H:%M"),
+            TimeWrapper::from(analysis.first_trade_time.clone()).to_datetime_local().format("%m-%d %H:%M"),
+            TimeWrapper::from(analysis.liquidity_add_time.clone()).to_datetime_local().format("%m-%d %H:%M"),
             analysis.monitor_id,
             analysis.risk_level,
             analysis.next_update_minutes,
@@ -2233,29 +2266,10 @@ impl TokenMonitor {
     }
 
     async fn cleanup_cache(&self) -> Result<()> {
-        let mut cache = self.cache.lock().await;
-        
-        // 清理过期的区块数据
-        let now = SystemTime::now();
-        cache.blocks.retain(|_, block| {
-            block.block_time
-                .map(|t| now.duration_since(UNIX_EPOCH).unwrap().as_secs() - t as u64 < 3600)
-                .unwrap_or(false)
-        });
-
-        // 清理过期的代币信息
-        let expired: Vec<_> = cache.token_info
-            .iter()
-            .filter(|(_, (_, time))| {
-                time.elapsed().unwrap().as_secs() > 1800 // 30分钟过期
-            })
-            .map(|(k, _)| *k)
-            .collect();
-
-        for key in expired {
-            cache.token_info.remove(&key);
-        }
-
+        let cache = self.cache.lock().await;
+        cache.blocks.clear();
+        cache.txs.clear();
+        cache.token_info.clear();
         Ok(())
     }
 
@@ -2267,11 +2281,14 @@ impl TokenMonitor {
     fn process_transaction(&self, tx: &EncodedTransaction) -> Result<()> {
         match tx {
             EncodedTransaction::Json(tx_json) => {
-                if let Some(message) = &tx_json.message {
-                    // 正确访问 message 字段
-                    if let Some(account_keys) = &message.account_keys {
-                        if account_keys.contains(&self.pump_program) {
-                            // 处理 pump 交易
+                if let Some(ui_message) = tx_json.message {
+                    let message = &ui_message;
+
+                    for instruction in &message.instructions {
+                        if let UiInstruction::Parsed(parsed_instruction) = instruction {
+                            if parsed_instruction.program == "spl-token" {
+                                // 处理 pump 交易
+                            }
                         }
                     }
                 }
@@ -2461,7 +2478,7 @@ impl TokenMonitor {
     fn create_funding_chain(&self, transfer: Transfer) -> FundingChain {
         FundingChain {
             source_wallet: transfer.source,
-            destination_wallet: transfer.destination,
+            destination_wallet: transfer.to_address,
             total_amount: transfer.amount,
             transfers: vec![transfer],
         }
@@ -2789,21 +2806,21 @@ impl TokenMonitor {
     }
 
     // 4. 修复 risk_level 和 attention_level 类型不匹配
-    fn get_risk_level(&self, risk_score: u8) -> u8 {
+    fn get_risk_level(&self, risk_score: u8) -> String {
         match risk_score {
-            0..=39 => 1,  // 低风险
-            40..=69 => 2, // 中风险
-            70..=100 => 3, // 高风险
-            _ => 0, // 未知
+            0..=39 => "低风险".to_string(),
+            40..=69 => "中风险".to_string(),
+            70..=100 => "高风险".to_string(),
+            _ => "未知".to_string(),
         }
     }
 
-    fn get_attention_level(&self, risk_score: u8) -> u8 {
+    fn get_attention_level(&self, risk_score: u8) -> String {
         match risk_score {
-            0..=39 => 1,  // 无关注
-            40..=69 => 2, // 关注
-            70..=100 => 3, // 高度关注
-            _ => 0, // 未知
+            0..=39 => "无关注".to_string(),
+            40..=69 => "关注".to_string(),
+            70..=100 => "高度关注".to_string(),
+            _ => "未知".to_string(),
         }
     }
 
@@ -2922,6 +2939,44 @@ impl TokenMonitor {
 
         Ok(())
     }
+
+    async fn send_alert(&self, title: &str, message: &str) -> Result<()> {
+        // ServerChan 通知
+        if let Some(key) = self.config.serverchan.keys.first() {
+            let url = format!("https://sctapi.ftqq.com/{}.send", key);
+            self.client
+                .post(&url)
+                .form(&[("title", title), ("desp", message)])
+                .send()
+                .await?;
+        }
+
+        // WeChat Ferry 通知
+        for group in &self.config.wcf.groups {
+            let url = format!("http://127.0.0.1:8080/send?wxid={}", group.wxid);
+            self.client
+                .post(&url)
+                .json(&serde_json::json!({
+                    "message": format!("{}\n{}", title, message)
+                }))
+                .send()
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn update_rpc_health(&self, url: String, status: bool) {
+        let mut rpc_health = self.rpc_health.lock().await;
+        rpc_health.insert(url.clone(), status);
+        self.rpc_pool.health_status.insert(url, status); // 应该是 self.rpc_pool.health_status
+    }
+
+    async fn analyze_holders(&self, mint: &Pubkey) -> Result<HolderDistribution> {
+        // 实现分析持有者的逻辑
+        // ...
+        Ok(HolderDistribution::default())
+    }
 }
 
 // 6. 修复 TimeWrapper 相关的类型转换
@@ -2934,6 +2989,17 @@ impl From<DateTime<Local>> for TimeWrapper {
 impl From<SystemTime> for TimeWrapper {
     fn from(st: SystemTime) -> Self {
         TimeWrapper(st)
+    }
+}
+
+impl TimeWrapper {
+    pub fn format(&self, fmt: &str) -> String {
+        let datetime: DateTime<Local> = self.0.into();
+        datetime.format(fmt).to_string()
+    }
+
+    pub fn to_datetime_local(&self) -> DateTime<Local> {
+        DateTime::<Local>::from(self.0)
     }
 }
 
@@ -3167,6 +3233,11 @@ pub struct MonitorMetrics {
     pub processed_txs: u64,
     pub rpc_requests: u64,
     pub rpc_errors: u64,
+    pub missed_blocks: Vec<u64>,
+    pub processing_delays: VecDeque<Duration>,
+    pub block_processing_latency: AtomicU64,
+    pub tx_processing_latency: AtomicU64,
+    pub token_analysis_latency: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -3196,8 +3267,8 @@ pub struct NotificationData {
     pub message: String,
     pub level: AlertLevel,
     pub timestamp: TimeWrapper,  // 改用 TimeWrapper
-    pub risk_level: u8,
-    pub attention_level: u8,
+    pub risk_level: String, // 风险等级，修改为 String
+    pub attention_level: String, // 关注等级，修改为 String
     pub symbol: String,
     pub name: String,
     pub contract: String,
@@ -3230,8 +3301,8 @@ impl Default for NotificationData {
             message: String::new(),
             level: AlertLevel::Low,
             timestamp: TimeWrapper::default(),
-            risk_level: 0,
-            attention_level: 0,
+            risk_level: String::new(),
+            attention_level: String::new(),
             symbol: String::new(),
             name: String::new(),
             contract: String::new(),
@@ -3368,6 +3439,13 @@ struct MonitorState {
     watch_addresses: HashSet<String>,
     metrics: MonitorMetrics,
     start_time: TimeWrapper,  // 改用 TimeWrapper 替代 SystemTime
+    last_block_slot: u64,
+}
+
+impl MonitorState { // 手动实现 Default trait
+    fn default() -> Self {
+        MonitorState { last_update: TimeWrapper::default(), processed_blocks: 0, processed_tokens: 0, alerts: Vec::new(), watch_addresses: HashSet::new(), metrics: MonitorMetrics::default(), start_time: TimeWrapper::default(), last_block_slot: 0 } // 使用 UNIX_EPOCH 作为默认值
+    }
 }
 
 #[derive(Debug, Deserialize)]
